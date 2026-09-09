@@ -641,9 +641,8 @@ internal partial class InterfaceManager : IInternalDisposableService
         if (CSFramework.Instance()->GetNetworkModuleProxy() == null)
             return;
 
-        this.SetupHooks(Service<TargetSigScanner>.Get(), Service<FontAtlasFactory>.Get());
-
         this.framework.Update -= this.FrameworkOnUpdate;
+        this.SetupHooks(Service<TargetSigScanner>.Get(), Service<FontAtlasFactory>.Get());
     }
 
     /// <summary>Checks if the provided swap chain is the target that Dalamud should draw its interface onto,
@@ -1304,9 +1303,7 @@ internal partial class InterfaceManager : IInternalDisposableService
             && gamepadState.Raw(GamepadButtons.L1) > 0
             && gamepadState.Pressed(GamepadButtons.L3) > 0)
         {
-            io.ConfigFlags ^= ImGuiConfigFlags.NavEnableGamepad;
-            gamepadState.NavEnableGamepad ^= true;
-            dalamudInterface.ToggleGamepadModeNotifierWindow();
+            gamepadState.EnableGamepadNav ^= true;
         }
 
         if (gamepadEnabled && (io.ConfigFlags & ImGuiConfigFlags.NavEnableGamepad) > 0)
