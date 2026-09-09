@@ -11,7 +11,7 @@ namespace Dalamud.Support;
 /// <remarks>Avoids repeatedly enumerating <see cref="Process.Modules"/>.</remarks>
 internal static unsafe partial class CurrentProcessModules
 {
-    /// <summary>Gets all the loaded modules, up to date.</summary>
+    /// <summary>Gets the cached process-module list, refreshing it after a module-change notification.</summary>
     public static ProcessModuleCollection ModuleCollection
     {
         get

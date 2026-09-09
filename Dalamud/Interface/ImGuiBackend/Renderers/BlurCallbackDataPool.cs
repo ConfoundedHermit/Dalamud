@@ -5,7 +5,7 @@ using System.Threading;
 namespace Dalamud.Interface.ImGuiBackend.Renderers;
 
 /// <summary>
-/// A capped static pool for <see cref="BlurCallbackData"/> structs.
+/// A fixed-size pool with heap fallback for <see cref="BlurCallbackData"/> structs.
 /// </summary>
 internal static unsafe class BlurCallbackDataPool
 {
@@ -20,7 +20,8 @@ internal static unsafe class BlurCallbackDataPool
     /// <summary>
     /// Rents a <see cref="BlurCallbackData"/> slot from the pool.
     /// Falls back to <see cref="NativeMemory.AllocZeroed(nuint)"/> when all slots are in flight.
-    /// Caller must populate every field and return the pointer via <see cref="Return"/> when done.
+    /// Caller must populate every field and return the pointer via <see cref="Return"/> exactly once,
+    /// after all snapshots borrowing it have retired.
     /// </summary>
     /// <returns>
     /// Pointer to the rented <see cref="BlurCallbackData"/>.
@@ -49,6 +50,7 @@ internal static unsafe class BlurCallbackDataPool
     /// Returns a <see cref="BlurCallbackData"/> pointer back to the pool.
     /// If the pointer originated from the heap fallback it is freed instead.
     /// </summary>
+    /// <remarks>Return each allocation exactly once, after all readers have finished. The payload must not be used after return.</remarks>
     /// <param name="ptr">
     /// Pointer previously obtained from <see cref="Rent"/>.
     /// </param>

@@ -170,8 +170,8 @@ internal unsafe partial class Dx11Renderer : IImGuiRenderer
     /// <inheritdoc/>
     public void RenderViewportSnapshot(nint rendererUserData, ImDrawDataPtr drawData)
     {
-        // Capture normally records only initialized handles, and snapshot locking keeps them alive; retain
-        // defensive validation at the renderer boundary.
+        // The caller must keep the captured handle alive throughout drawing and presentation.
+        // These checks handle missing data; they cannot validate the lifetime of an arbitrary handle.
         if (rendererUserData == nint.Zero)
             return;
 
@@ -433,6 +433,7 @@ internal unsafe partial class Dx11Renderer : IImGuiRenderer
                     {
                         if ((nint)cmd.UserCallback == (nint)CustomImDrawCallbackEnum.Blur)
                         {
+                            // The command borrows this payload; frame retirement returns it after repeated renders.
                             var data = (BlurCallbackData*)cmd.UserCallbackData;
                             var blurStrength = data->BlurStrength;
                             var rounding = data->Rounding;

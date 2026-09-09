@@ -29,46 +29,43 @@ internal sealed unsafe class Dx11Win32Backend : IWin32Backend
     private readonly Dx11Renderer imguiRenderer;
     private readonly Win32InputHandler imguiInput;
 
-    // Smooth Motion may call Render() several times, from several threads, for one game-thread Step(). Snapshots
-    // keep those renders independent from the live ImGui state that plugins mutate during the following Step().
+    // Presentation callbacks may call Render() repeatedly from different threads for one game-thread Step().
+    // Snapshots separate draw submission from live UI construction; their resources still require retirement.
     //
     // Lock-acquisition order / contract for drawDataLock:
-    //   - Render() is serialized by renderLock, then takes the READ lock to render the stable snapshot.
-    //   - Step() takes the WRITE lock for the (short) draw-data copy.
-    //   - A swap-chain resize takes the WRITE lock for the whole resize window via EnterResize()/ExitResize(),
-    //     guaranteeing no pacer-thread Render() is compositing while the swap chain's back buffers are reallocated.
-    //   - resizeInProgress is checked lock-free as a fast-path skip in Step()/Render(); correctness is still
-    //     guaranteed by the write lock, the flag just avoids queuing work behind the resize writer.
-    //   - EnterResize()/ExitResize() must be paired on the SAME thread and must not be nested with Step()/Render()
-    //     on that thread (the lock is NoRecursion).
+    //   - Render() takes renderLock, then the read lock for the complete main and secondary render pass.
+    //   - Step() holds the write lock across platform-window updates, snapshot capture, and resource retirement.
+    //   - Resize callers must hold the write lock across reallocation via paired EnterResize()/ExitResize() calls.
+    //   - resizeInProgress provides an early skip; the write lock excludes snapshot readers and writers.
+    //   - Resize acquisitions must be paired on the same thread and must not be nested with each other or
+    //     Step()/Render() on that thread because drawDataLock is non-recursive.
     //
-    // The D3D11 immediate context and the renderer's dynamic buffers are not safe for concurrent use. Smooth
-    // Motion can invoke our present hook from multiple threads, so renderLock must be acquired before the read
-    // lock. This keeps render calls waiting outside drawDataLock instead of making them active readers that block
-    // Step() or a swap-chain resize.
+    // The shared immediate context and dynamic renderer buffers require serialized rendering. Taking renderLock
+    // first keeps competing renders outside drawDataLock instead of letting idle readers block capture or resize.
     private readonly Lock renderLock = new();
     private readonly ReaderWriterLockSlim drawDataLock = new(LockRecursionPolicy.NoRecursion);
     private readonly DrawDataSnapshot snapshot = new();
 
-    // Secondary viewports also need snapshots because ImGui's platform viewport list is single-buffered and may
-    // be mutated by the next Step() while an NVIDIA pacing thread renders the current frame.
+    // Capture secondary viewports so presentation threads do not enumerate ImGui's live platform viewport list.
     private readonly ViewportSnapshot viewportSnapshots = new();
 
     // Lock-free early-out for a resize; drawDataLock remains the synchronization mechanism.
     private volatile bool resizeInProgress;
 
-    // Tracks resize ownership so asymmetric ReShade callbacks cannot recursively enter or incorrectly release
-    // the non-recursive write lock.
+    // Records the acquiring thread to detect duplicate enters and exits with no recorded owner.
+    // This is not a nesting count; callers must pair each acquisition and release on the same thread.
     private int resizeOwnerThreadId;
 
+    // Retain the input interface for presentation-target identity checks, even when drawing uses a peeled chain.
     private ComPtr<IDXGISwapChain> swapChainPossiblyWrapped;
+    // Separately retained and ReShade-peeled interface used to acquire drawing resources.
     private ComPtr<IDXGISwapChain> swapChain;
     private ComPtr<ID3D11Device> device;
     private ComPtr<ID3D11DeviceContext> deviceContext;
     private ComPtr<ID3D11Multithread> deviceMultithread;
     private bool restoreMultithreadProtection;
 
-    // Secondary swap chains are presented once per Step, even when the main snapshot is composited repeatedly.
+    // Attempt secondary presentation at most once per captured Step, even when the main snapshot renders repeatedly.
     private int platformWindowsRenderedForStep = 1;
 
     private int targetWidth;
@@ -79,7 +76,7 @@ internal sealed unsafe class Dx11Win32Backend : IWin32Backend
     /// </summary>
     /// <param name="swapChain">The pointer to an instance of <see cref="IDXGISwapChain"/>. The reference is copied.</param>
     /// <param name="enableMultithreadProtection">
-    /// Whether to enable D3D11 runtime serialization for Smooth Motion's cross-thread immediate-context access.
+    /// Whether to request D3D11 runtime protection for shared immediate-context access. Logs if unavailable.
     /// </param>
     public Dx11Win32Backend(IDXGISwapChain* swapChain, bool enableMultithreadProtection)
     {
@@ -99,9 +96,8 @@ internal sealed unsafe class Dx11Win32Backend : IWin32Backend
 
             if (enableMultithreadProtection)
             {
-                // Smooth Motion uses its own capture and pacing threads while Dalamud renders through the game's
-                // immediate context. Protect the shared context at the D3D11 runtime level so calls from the game,
-                // NVIDIA and Dalamud cannot race each other. A private managed lock only protects Dalamud calls.
+                // Request runtime protection for the shared immediate context because graphics middleware can use it
+                // from other threads. Dalamud's managed locks cannot serialize callers outside Dalamud.
                 fixed (Guid* guid = &IID.IID_ID3D11Multithread)
                 fixed (ID3D11Multithread** pp = &this.deviceMultithread.GetPinnableReference())
                 {
@@ -239,13 +235,14 @@ internal sealed unsafe class Dx11Win32Backend : IWin32Backend
         ImGui.NewFrame();
         ImGuizmo.BeginFrame();
 
-        // Plugin UI does not touch snapshot storage, so it need not block an in-flight render.
+        // Build live UI before acquiring snapshot write access. Resources referenced by the previous snapshot
+        // must remain valid until retirement, even if UI construction requests their disposal.
         this.BuildUi?.Invoke();
 
         ImGui.Render();
 
-        // Keep platform-window mutation and capture in one write transaction so pacing-thread renders cannot
-        // observe a viewport being created, resized, or destroyed.
+        // Keep platform-window mutation and capture in one write transaction to exclude snapshot rendering
+        // while a viewport is created, resized, or destroyed.
         this.drawDataLock.EnterWriteLock();
         try
         {
@@ -273,7 +270,7 @@ internal sealed unsafe class Dx11Win32Backend : IWin32Backend
             // Retire resources only after readers of the previous snapshot have drained.
             this.PostCopy?.Invoke();
 
-            // Defer secondary presentation to Render(); presenting it here can race NVIDIA's worker threads.
+            // Let Render() present secondary windows under the same serialization as the main snapshot.
             Volatile.Write(ref this.platformWindowsRenderedForStep, 0);
         }
         finally
@@ -285,8 +282,7 @@ internal sealed unsafe class Dx11Win32Backend : IWin32Backend
     /// <inheritdoc/>
     public void Render()
     {
-        // Fast-path skip while a resize is in progress; the write lock already guarantees correctness, this just
-        // avoids queuing readers behind the resize writer.
+        // Skip work while resize is announced; the write lock supplies snapshot exclusion.
         if (this.resizeInProgress)
             return;
 
@@ -303,8 +299,7 @@ internal sealed unsafe class Dx11Win32Backend : IWin32Backend
                 // The main snapshot may be composited once for every generated frame.
                 this.imguiRenderer.RenderDrawData(new ImDrawDataPtr(this.snapshot.Handle));
 
-                // Secondary windows should not advance at Smooth Motion's generated-frame rate. Present their stable
-                // snapshots once instead of walking ImGui's live platform viewport list from a pacing thread.
+                // Attempt secondary presentation at most once per capture, independent of the main presentation rate.
                 if (Interlocked.CompareExchange(ref this.platformWindowsRenderedForStep, 1, 0) == 0)
                 {
                     for (var i = 1; i < this.viewportSnapshots.Count; i++)
@@ -326,8 +321,8 @@ internal sealed unsafe class Dx11Win32Backend : IWin32Backend
     /// <inheritdoc/>
     public void EnterResize()
     {
-        // ReShade splits resize across destroy/init callbacks; ignore a duplicate enter rather than deadlocking
-        // this non-recursive lock and permanently suppressing Step()/Render().
+        // Detect a same-thread duplicate enter before attempting the non-recursive write lock.
+        // Ignoring it does not acquire another level of ownership or balance a later nested exit.
         var currentThreadId = Environment.CurrentManagedThreadId;
         if (this.resizeOwnerThreadId == currentThreadId)
         {
@@ -344,14 +339,14 @@ internal sealed unsafe class Dx11Win32Backend : IWin32Backend
         this.drawDataLock.EnterWriteLock();
         this.resizeOwnerThreadId = currentThreadId;
 
-        // Do not present viewport snapshots captured against the old swap-chain buffers.
+        // Drop secondary viewport captures associated with the old buffers. The separate main snapshot is retained.
         this.viewportSnapshots.BeginCapture();
     }
 
     /// <inheritdoc/>
     public void ExitResize()
     {
-        // An unmatched ReShade init callback must not throw or leave rendering disabled.
+        // Ignore an exit with no recorded owner. Exits with an owner still require the acquiring thread.
         if (this.resizeOwnerThreadId == 0)
         {
             Log.Warning("ExitResize() called without a matching EnterResize(); ignoring.");
@@ -433,6 +428,7 @@ internal sealed unsafe class Dx11Win32Backend : IWin32Backend
         ImPlot.DestroyContext();
         ImGui.DestroyContext();
 
+        // Disable protection only if this backend enabled it from a previously disabled state.
         if (this.restoreMultithreadProtection && !this.deviceMultithread.IsEmpty())
             this.deviceMultithread.Get()->SetMultithreadProtected(BOOL.FALSE);
         this.deviceMultithread.Dispose();

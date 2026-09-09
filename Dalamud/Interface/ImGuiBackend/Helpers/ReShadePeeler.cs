@@ -37,7 +37,7 @@ internal static unsafe class ReShadePeeler
     {
         var changed = false;
 
-        // Unknown wrapper layouts may contain cycles; stop instead of repeatedly following the same object.
+        // Stop when an object is revisited during this peel call.
         var visited = new HashSet<nint>();
         while (comptr->Get() != null && IsReShadedComObject(comptr->Get()))
         {
@@ -45,7 +45,7 @@ internal static unsafe class ReShadePeeler
             if (!visited.Add(currentObject))
                 break;
 
-            // Known ReShade wrappers store the underlying interface near their vtable pointer.
+            // Scan pointer-sized fields through offset 0x20 for an underlying interface. This is a layout heuristic.
             var peeled = false;
             for (nint i = 8; i <= 0x20; i += 8)
             {
@@ -73,8 +73,8 @@ internal static unsafe class ReShadePeeler
                 if (!valid)
                     continue;
 
-                // Interpret the object as an IUnknown.
-                // Note that `using` is not used, and `Attach` is used. We do not alter the reference count yet.
+                // Borrow the candidate without AddRef; do not dispose this temporary pointer.
+                // As acquires an owned reference, which is transferred to comptr on a successful replacement.
                 var punk = default(ComPtr<IUnknown>);
                 punk.Attach((IUnknown*)pObjectBehind);
 
@@ -180,6 +180,7 @@ internal static unsafe class ReShadePeeler
         }
     }
 
+    // Check current mappings only; readable memory does not establish COM identity or preserve object lifetime.
     private static bool IsValidReadableMemoryAddress(nint p, nint size)
     {
         if (size < 0)
@@ -214,6 +215,7 @@ internal static unsafe class ReShadePeeler
         return true;
     }
 
+    // Check executable protection across the requested range without retaining the mapped memory.
     private static bool IsValidExecutableMemoryAddress(nint p, nint size)
     {
         if (size < 0)

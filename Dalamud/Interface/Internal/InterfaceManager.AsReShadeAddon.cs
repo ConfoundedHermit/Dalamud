@@ -11,7 +11,8 @@ namespace Dalamud.Interface.Internal;
 /// </summary>
 internal unsafe partial class InterfaceManager
 {
-    // ReShade splits a resize across destroy and init callbacks; retain ownership across that callback boundary.
+    // Records an enter from the destroy callback for release during init. Callbacks must pair on the same thread;
+    // this flag does not track the swap-chain identity or count overlapping resize acquisitions.
     private bool reShadeResizeEntered;
 
     private void ReShadeAddonInterfaceOnDestroySwapChain(ref ReShadeAddonInterface.ApiObject swapChain)
@@ -20,7 +21,7 @@ internal unsafe partial class InterfaceManager
         if (this.backend?.IsAttachedToPresentationTarget((nint)swapChainNative) is not true)
             return;
 
-        // OnInitSwapChain releases this exclusion after ReShade has recreated the target.
+        // The corresponding init callback must release resize exclusion on this thread.
         this.backend?.EnterResize();
         this.reShadeResizeEntered = true;
 
@@ -32,7 +33,7 @@ internal unsafe partial class InterfaceManager
 
     private void ReShadeAddonInterfaceOnInitSwapChain(ref ReShadeAddonInterface.ApiObject swapChain)
     {
-        // Keep all validation inside the try so every path balances the exclusion acquired by the destroy callback.
+        // Run the release check even if target validation or GetDesc returns early.
         try
         {
             var swapChainNative = swapChain.GetNative<IDXGISwapChain>();
@@ -47,7 +48,7 @@ internal unsafe partial class InterfaceManager
         }
         finally
         {
-            // Balance OnDestroySwapChain even when target validation or GetDesc fails.
+            // Release the recorded destroy-callback acquisition; same-thread pairing is required.
             if (this.reShadeResizeEntered)
             {
                 this.reShadeResizeEntered = false;
@@ -85,11 +86,12 @@ internal unsafe partial class InterfaceManager
         DXGI_FORMAT newFormat,
         uint swapChainFlags)
     {
-        // Hooked vtbl instead of registering ReShade event. This check is correct.
+        // This is a DXGI detour, so identify the game target from the native swap-chain interface.
         if (!SwapChainHelper.IsGameDeviceSwapChain(swapChain))
             return this.dxgiSwapChainResizeBuffersHook!.Original(swapChain, bufferCount, width, height, newFormat, swapChainFlags);
 
-        // Exclude frame capture and worker-thread rendering for the complete back-buffer reallocation.
+        // Request snapshot exclusion across reallocation. Destroy/init callbacks may also enter resize;
+        // the backend does not count nested acquisitions, so their exits can release this acquisition.
         this.backend?.EnterResize();
         try
         {

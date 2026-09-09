@@ -395,10 +395,9 @@ internal sealed partial class TextureManager
 
     private void ReleaseUnmanagedResources() => this.device.Reset();
 
-    /// <summary>Runs the given action in IDXGISwapChain.Present immediately or waiting as needed.</summary>
+    /// <summary>Runs the action inline when presentation is reported active, otherwise queues it before rendering.</summary>
+    /// <remarks>The activity flag does not establish that the caller owns the DXGI or ReShade presentation callback's locks.</remarks>
     /// <param name="action">The action to run.</param>
-    // Presentation may run on a worker thread; execute inline when already inside the serialized callback instead
-    // of queuing work behind that same callback.
     private async Task RunDuringPresent(Action action)
     {
         if (this.interfaceManager.IsAnyThreadInPresent)
@@ -407,7 +406,8 @@ internal sealed partial class TextureManager
             await this.interfaceManager.RunBeforeImGuiRender(action);
     }
 
-    /// <summary>Runs the given function in IDXGISwapChain.Present immediately or waiting as needed.</summary>
+    /// <summary>Runs the function inline when presentation is reported active, otherwise queues it before rendering.</summary>
+    /// <remarks>The activity flag does not establish that the caller owns the DXGI or ReShade presentation callback's locks.</remarks>
     /// <typeparam name="T">The type of the return value.</typeparam>
     /// <param name="func">The function to run.</param>
     /// <returns>The return value from the function.</returns>

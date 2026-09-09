@@ -19,6 +19,10 @@ public static class ThreadSafety
     /// Gets the shared lock that prevents worker-thread rendering from overlapping the original native framework
     /// update.
     /// </summary>
+    /// <remarks>
+    /// This reentrant monitor allows the game thread to present during the native update.
+    /// The managed framework tick runs before this lock is acquired and is not protected by it.
+    /// </remarks>
     internal static object NativeFrameworkRenderSyncRoot { get; } = new();
 
     /// <summary>

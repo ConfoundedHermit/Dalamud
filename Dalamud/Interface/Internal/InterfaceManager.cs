@@ -50,18 +50,6 @@ using CSFramework = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework;
 
 using DWMWINDOWATTRIBUTE = Windows.Win32.Graphics.Dwm.DWMWINDOWATTRIBUTE;
 
-// general dev notes, here because it's easiest
-
-/*
- * - Hooking ResizeBuffers seemed to be unnecessary, though I'm not sure why.  Left out for now since it seems to work without it.
- * - We may want to build our ImGui command list in a thread to keep it divorced from present.  We'd still have to block in present to
- *   synchronize on the list and render it, but ideally the overall delay we add to present would then be shorter.  This may cause minor
- *   timing issues with anything animated inside ImGui, but that is probably rare and may not even be noticeable.
- * - Our hook is too low level to really work well with debugging, as we only have access to the 'real' dx objects and not any
- *   that have been hooked/wrapped by tools.
- * - Might eventually want to render to a separate target and composite, especially with reshade etc in the mix.
- */
-
 namespace Dalamud.Interface.Internal;
 
 /// <summary>
@@ -83,8 +71,8 @@ internal partial class InterfaceManager : IInternalDisposableService
 
     private static readonly ModuleLog Log = ModuleLog.Create<InterfaceManager>();
 
-    // Delay cleanup by one completed snapshot generation so repeated generated-frame renders cannot reference
-    // resources that BuildUi has already released. This avoids exposing render reference counting to plugins.
+    // Keep resources whose disposal was requested during UI construction alive across repeated presentations.
+    // PostCopy promotes pending cleanup into a batch that runs after the following snapshot capture.
     private readonly ConcurrentQueue<Action> pendingRetireQueue = new();
     private readonly List<Action> frameRetireActions = [];
 
@@ -113,7 +101,8 @@ internal partial class InterfaceManager : IInternalDisposableService
 
     private IWin32Backend? backend;
 
-    // Treat an NvPresent wrapper as the Smooth Motion signal used to enable D3D11 runtime serialization.
+    // Successful NvPresent unwrapping supplies the Smooth Motion signal for D3D11 runtime protection.
+    // This does not query driver settings; successful ReShade addon and legacy hook selection bypass detection.
     private bool isSmoothMotionDetected;
 
     private Hook<SetCursorDelegate>? setCursorHook;
@@ -261,7 +250,10 @@ internal partial class InterfaceManager : IInternalDisposableService
     public bool IsDispatchingEvents { get; set; } = true;
 
     /// <summary>Gets a value indicating whether Dalamud is executing a serialized presentation callback.</summary>
-    /// <remarks>The callback may run on a presentation worker thread when frame generation is active.</remarks>
+    /// <remarks>
+    /// Reports presentation activity across threads. A true value does not establish that the calling thread
+    /// is executing the callback or holds its synchronization locks.
+    /// </remarks>
     public bool IsAnyThreadInPresent { get; private set; }
 
     /// <summary>
@@ -360,7 +352,7 @@ internal partial class InterfaceManager : IInternalDisposableService
         Interlocked.Exchange(ref this.dalamudAtlas, null)?.Dispose();
         Interlocked.Exchange(ref this.backend, null)?.Dispose();
 
-        // Drain any retire actions that were not processed due to shutdown.
+        // Drain remaining retirement actions after backend disposal, without acquiring snapshot write access.
         foreach (var action in this.frameRetireActions)
             action.InvokeSafely();
         this.frameRetireActions.Clear();
@@ -392,33 +384,36 @@ internal partial class InterfaceManager : IInternalDisposableService
     }
 
     /// <summary>
-    /// Defers an action until all render passes that could reference the current frame have completed.
+    /// Queues an action for frame retirement.
     /// </summary>
     /// <remarks>
-    /// The action runs under snapshot write exclusion, making it suitable for releasing shader-resource views,
-    /// unmanaged callback data, and other resources captured by ImGui draw commands. It is safe to call from any
-    /// thread.
+    /// May be queued from any thread. During normal frame processing, pending actions are promoted after a
+    /// capture and executed after the following capture replaces that snapshot, under snapshot write exclusion.
+    /// Resize drains both batches under resize exclusion; shutdown drains them after backend disposal.
+    /// Actions must not re-enter snapshot rendering, capture, or resize while write exclusion is held.
+    /// This coordinates CPU-side snapshot use; it does not wait for GPU completion or preserve thread affinity.
     /// </remarks>
     /// <param name="action">
-    /// The cleanup action to run when the current frame is fully retired.
+    /// The cleanup action to run during retirement.
     /// </param>
     public void DeferUntilFrameRetired(Action action) => this.pendingRetireQueue.Enqueue(action);
 
     /// <summary>
-    /// Enqueue a texture to be disposed once the current frame's render passes are complete.
+    /// Queues a texture for disposal through <see cref="DeferUntilFrameRetired"/>.
     /// </summary>
     /// <param name="wrap">The texture.</param>
     public void EnqueueDeferredDispose(IDeferredDisposable wrap)
         => this.DeferUntilFrameRetired(wrap.RealDispose);
 
     /// <summary>
-    /// Enqueue an <see cref="ILockedImFont"/> to be disposed once the current frame's render passes are complete.
+    /// Queues a disposable, such as an <see cref="ILockedImFont"/>, for release through <see cref="DeferUntilFrameRetired"/>.
     /// </summary>
     /// <param name="locked">The disposable.</param>
     public void EnqueueDeferredDispose(IDisposable locked)
         => this.DeferUntilFrameRetired(locked.Dispose);
 
-    /// <summary>Queues an action to be run before <see cref="ImGui.Render"/> call.</summary>
+    /// <summary>Queues an action before the backend render call in a serialized presentation callback.</summary>
+    /// <remarks>The action runs on the presentation thread, which may differ from the game thread.</remarks>
     /// <param name="action">The action.</param>
     /// <returns>A <see cref="Task"/> that resolves once <paramref name="action"/> is run.</returns>
     public Task RunBeforeImGuiRender(Action action)
@@ -440,7 +435,8 @@ internal partial class InterfaceManager : IInternalDisposableService
         return tcs.Task;
     }
 
-    /// <summary>Queues a function to be run before <see cref="ImGui.Render"/> call.</summary>
+    /// <summary>Queues a function before the backend render call in a serialized presentation callback.</summary>
+    /// <remarks>The function runs on the presentation thread, which may differ from the game thread.</remarks>
     /// <typeparam name="T">The type of the return value.</typeparam>
     /// <param name="func">The function.</param>
     /// <returns>A <see cref="Task"/> that resolves once <paramref name="func"/> is run.</returns>
@@ -462,7 +458,8 @@ internal partial class InterfaceManager : IInternalDisposableService
         return tcs.Task;
     }
 
-    /// <summary>Queues an action to be run after <see cref="ImGui.Render"/> call.</summary>
+    /// <summary>Queues an action after the backend render call in a serialized presentation callback.</summary>
+    /// <remarks>The action runs on the presentation thread, which may differ from the game thread.</remarks>
     /// <param name="action">The action.</param>
     /// <returns>A <see cref="Task"/> that resolves once <paramref name="action"/> is run.</returns>
     public Task RunAfterImGuiRender(Action action)
@@ -484,7 +481,8 @@ internal partial class InterfaceManager : IInternalDisposableService
         return tcs.Task;
     }
 
-    /// <summary>Queues a function to be run after <see cref="ImGui.Render"/> call.</summary>
+    /// <summary>Queues a function after the backend render call in a serialized presentation callback.</summary>
+    /// <remarks>The function runs on the presentation thread, which may differ from the game thread.</remarks>
     /// <typeparam name="T">The type of the return value.</typeparam>
     /// <param name="func">The function.</param>
     /// <returns>A <see cref="Task"/> that resolves once <paramref name="func"/> is run.</returns>
@@ -632,7 +630,7 @@ internal partial class InterfaceManager : IInternalDisposableService
 
     private unsafe void FrameworkOnUpdate(IFramework framework1)
     {
-        // We now delay hooking until Framework is set up and has fired its first update.
+        // Delay hook installation until Framework is set up and has fired its first update.
         // Some graphics drivers seem to consider the game's shader cache as invalid if we hook too early.
         // The game loads shader packages on the file thread and then compiles them. It will show the logo once it is done.
         // This is a workaround, but it fixes an issue where the game would take a very long time to get to the title screen.
@@ -685,9 +683,9 @@ internal partial class InterfaceManager : IInternalDisposableService
     /// <param name="activeBackend">The scene to draw to.</param>
     private void RenderDalamudDraw(IImGuiBackend activeBackend)
     {
-        // Smooth Motion can invoke Present from multiple threads. The queued pre/post actions may touch the
-        // immediate context and ImGui state too, so serialize the complete render transaction rather than only
-        // the backend draw submission.
+        // Presentation callbacks may run on multiple threads. Serialize queued actions and live ImGui access
+        // with drawing, and exclude the original native framework update through the shared monitor.
+        // Acquire NativeFrameworkRenderSyncRoot, renderDalamudLock, backend renderLock, then the snapshot read lock.
         lock (ThreadSafety.NativeFrameworkRenderSyncRoot)
         {
             lock (this.renderDalamudLock)
@@ -708,7 +706,7 @@ internal partial class InterfaceManager : IInternalDisposableService
                     else
                         ImGui.GetIO().ConfigFlags |= ImGuiConfigFlags.ViewportsEnable;
 
-                    // Call drawing functions, which in turn will call Draw event.
+                    // Render the captured frame; UI construction and Draw callbacks run during Step().
                     activeBackend.Render();
 
                     this.PostImGuiRender();
@@ -921,6 +919,8 @@ internal partial class InterfaceManager : IInternalDisposableService
     /// pass is active.</remarks>
     private void RetireResourcesForResize()
     {
+        // Resize entry clears secondary captures but retains the main snapshot. Draining these queues does not
+        // invalidate borrowed pointers in that snapshot or require a fresh capture before rendering resumes.
         foreach (var action in this.frameRetireActions)
             action.InvokeSafely();
         this.frameRetireActions.Clear();
@@ -1134,8 +1134,7 @@ internal partial class InterfaceManager : IInternalDisposableService
                     Log.Information("Using Smooth Motion");
                 goto default;
 
-            // Do no special ReShade handling.
-            // If SwapChainHookMode is set to VTable, do no special handling.
+            // Use the DXGI presentation hook, unwrapping NvPresent when recognized.
             case ReShadeHandlingMode.None:
             case var _ when this.dalamudConfiguration.SwapChainHookMode == SwapChainHelper.HookMode.VTable:
             default:

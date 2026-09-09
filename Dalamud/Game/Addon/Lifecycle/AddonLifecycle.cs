@@ -145,7 +145,7 @@ internal unsafe class AddonLifecycle : IInternalDisposableService
     {
         this.isInvokingListeners = true;
 
-        // Always restore this guard, including on the no-listener early return, so later registrations and removals
+        // Always clear this guard, including on the no-listener early return, so later registrations and removals
         // are not indefinitely treated as re-entrant listener changes.
         try
         {

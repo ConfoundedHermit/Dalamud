@@ -70,7 +70,7 @@ internal sealed class ViewportTextureWrap : IDalamudTextureWrap, IDeferredDispos
     /// <summary>Gets the task representing the first <see cref="Update"/> call.</summary>
     public Task<IDalamudTextureWrap> FirstUpdateTask => this.firstUpdateTaskCompletionSource.Task;
 
-    /// <summary>Queues a viewport copy before or after the next serialized ImGui render, as configured.</summary>
+    /// <summary>Schedules a framework tick that queues the viewport copy before or after a subsequent backend render call.</summary>
     public void QueueUpdate() =>
         Service<Framework>.Get().RunOnTick(
             () =>
@@ -82,7 +82,7 @@ internal sealed class ViewportTextureWrap : IDalamudTextureWrap, IDeferredDispos
             },
             cancellationToken: this.cancellationToken);
 
-    /// <summary>Queues the texture for disposal after all render passes using the current frame complete.</summary>
+    /// <summary>Queues the texture for disposal through <see cref="InterfaceManager.DeferUntilFrameRetired"/>.</summary>
     public void Dispose()
     {
         this.Dispose(true);
@@ -100,6 +100,7 @@ internal sealed class ViewportTextureWrap : IDalamudTextureWrap, IDeferredDispos
 
     private static unsafe ComPtr<ID3D11Texture2D> GetImGuiViewportBackBuffer(uint viewportId)
     {
+        // This lookup reads live ImGui metadata and requires the surrounding presentation/framework coordination.
         var viewports = ImGui.GetPlatformIO().Viewports;
         var viewportIndex = 0;
         for (; viewportIndex < viewports.Size; viewportIndex++)
@@ -130,7 +131,8 @@ internal sealed class ViewportTextureWrap : IDalamudTextureWrap, IDeferredDispos
         }
         else
         {
-            // See: ImGui_Impl_DX11.ImGuiViewportDataDx11
+            // TODO: Resolve the back buffer through the renderer. RendererUserData is a GCHandle token in
+            // Dx11Renderer, whereas the access below assumes a native swap-chain/render-target pointer layout.
             var rud = (nint*)viewports[viewportIndex].RendererUserData;
             if (rud == null || rud[0] == nint.Zero || rud[1] == nint.Zero)
                 throw new InvalidOperationException();

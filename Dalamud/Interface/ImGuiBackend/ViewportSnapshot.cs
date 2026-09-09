@@ -9,13 +9,13 @@ namespace Dalamud.Interface.ImGuiBackend;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Each entry owns a deep copy of one viewport's draw data (see <see cref="DrawDataSnapshot"/>) plus the
-/// information the renderer needs to draw and present that viewport. Entry index 0 is always the main viewport.
+/// Each entry owns a <see cref="DrawDataSnapshot"/> and borrows a renderer handle that must stay valid throughout
+/// rendering. Callers must exclude readers during capture, reset, and disposal. The backend captures the main
+/// viewport at index 0 by convention; this class does not enforce capture order.
 /// </para>
 /// <para>
-/// The backing <see cref="DrawDataSnapshot"/> instances are pooled and reused across frames: the list grows as
-/// the viewport count grows, but never shrinks its capacity. <see cref="BeginCapture"/> only resets the logical
-/// <see cref="Count"/> to zero, so steady-state capture incurs no native allocation churn.
+/// Entries are pooled by capture order, not viewport identity. <see cref="BeginCapture"/> resets only the logical
+/// <see cref="Count"/>; storage is reused while entry, draw-list, and buffer capacities suffice.
 /// </para>
 /// </remarks>
 internal sealed unsafe class ViewportSnapshot : IDisposable
@@ -31,7 +31,7 @@ internal sealed unsafe class ViewportSnapshot : IDisposable
     /// <summary>
     /// Gets the captured entry at the given index. Valid for <c>0 &lt;= index &lt; <see cref="Count"/></c>.
     /// </summary>
-    /// <param name="index">The entry index. Index 0 is the main viewport.</param>
+    /// <param name="index">The entry index. The backend uses index 0 for the main viewport.</param>
     /// <returns>The captured entry.</returns>
     public Entry this[int index] => this.entries[index];
 
@@ -56,10 +56,10 @@ internal sealed unsafe class ViewportSnapshot : IDisposable
     /// </summary>
     /// <param name="drawData">The live draw-data pointer for this viewport (obtained after ImGui.Render()).</param>
     /// <param name="rendererUserData">
-    /// The viewport's <c>RendererUserData</c> handle (the renderer-private viewport data). Zero for the main
+    /// The viewport's borrowed <c>RendererUserData</c> handle. Zero for the main
     /// viewport, which is composited via the renderer's main path rather than presented per-viewport.
     /// </param>
-    /// <param name="isMainViewport">Whether this is the main viewport (entry 0).</param>
+    /// <param name="isMainViewport">Whether this is the main viewport, which the caller must capture first.</param>
     public void Capture(ImDrawData* drawData, nint rendererUserData, bool isMainViewport)
     {
         Entry entry;
@@ -87,7 +87,7 @@ internal sealed unsafe class ViewportSnapshot : IDisposable
         /// <summary>Gets the owned deep copy of this viewport's draw data.</summary>
         public DrawDataSnapshot DrawData { get; } = new();
 
-        /// <summary>Gets or sets the viewport's renderer user data handle (zero for the main viewport).</summary>
+        /// <summary>Gets or sets the borrowed renderer user data handle (zero for the main viewport).</summary>
         public nint RendererUserData { get; set; }
 
         /// <summary>Gets or sets a value indicating whether this entry is the main viewport.</summary>

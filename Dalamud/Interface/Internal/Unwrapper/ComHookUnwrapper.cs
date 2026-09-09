@@ -7,13 +7,14 @@ using static TerraFX.Interop.Windows.Windows;
 
 namespace Dalamud.Interface.Internal.Unwrapper;
 
-/// <summary>Locates the underlying COM object stored by a graphics-middleware wrapper.</summary>
+/// <summary>Attempts to locate an underlying COM interface in a recognized graphics wrapper.</summary>
+/// <remarks>Memory checks reject unsuitable candidates but do not establish COM identity or preserve object lifetime.</remarks>
 internal abstract unsafe class ComHookUnwrapper
 {
     /// <summary>Removes consecutive wrappers recognized by <see cref="IsRelevantComObject{T}"/>.</summary>
     /// <param name="comptr">[inout] The COM pointer to an instance of <typeparamref name="T"/>.</param>
     /// <typeparam name="T">A COM type that is or extends <see cref="IUnknown"/>.</typeparam>
-    /// <returns><c>true</c> if peeled.</returns>
+    /// <returns><c>true</c> if at least one interface replacement succeeded.</returns>
     public bool Unwrap<T>(ComPtr<T>* comptr)
         where T : unmanaged, IUnknown.Interface
     {
@@ -23,7 +24,7 @@ internal abstract unsafe class ComHookUnwrapper
         nint vtblSize = vtblType.GetFields().Length * nint.Size;
         var changed = false;
 
-        // Unknown wrapper layouts may contain cycles; stop instead of repeatedly following the same object.
+        // Stop when an object is revisited during this unwrap call; callers repeating unwraps need their own cycle tracking.
         var visited = new HashSet<nint>();
         while (comptr->Get() != null && this.IsRelevantComObject(comptr->Get()))
         {
@@ -31,13 +32,13 @@ internal abstract unsafe class ComHookUnwrapper
             if (!visited.Add(currentObject))
                 break;
 
-            // Known wrappers store the underlying interface near their vtable pointer.
+            // Scan pointer-sized fields through offset 0x20 for an underlying interface. This is a layout heuristic.
             var peeled = false;
             for (nint i = nint.Size; i <= 0x20; i += nint.Size)
             {
                 var ppObjectBehind = (nint)comptr->Get() + i;
 
-                // Validate every pointer before dereferencing an undocumented wrapper layout.
+                // Check current memory mappings before dereferencing candidate fields in the undocumented layout.
                 if (!IsValidReadableMemoryAddress(ppObjectBehind, 8))
                     continue;
 
@@ -56,7 +57,8 @@ internal abstract unsafe class ComHookUnwrapper
                 if (!valid)
                     continue;
 
-                // Attach without changing the candidate's reference count; As owns the reference it acquires.
+                // Borrow the candidate without AddRef; do not dispose this temporary pointer.
+                // As acquires an owned reference, which is transferred to comptr on a successful replacement.
                 var punk = default(ComPtr<IUnknown>);
                 punk.Attach((IUnknown*)pObjectBehind);
 
@@ -83,7 +85,7 @@ internal abstract unsafe class ComHookUnwrapper
     }
 
     /// <summary>
-    /// Whether the given memory address is a valid readable userspace memory region of the given size.
+    /// Checks whether the requested userspace range is currently mapped with readable memory protection.
     /// </summary>
     /// <param name="p">Pointer to read from.</param>
     /// <param name="size">Size to read.</param>
@@ -123,7 +125,7 @@ internal abstract unsafe class ComHookUnwrapper
     }
 
     /// <summary>
-    /// Whether the given memory address is a valid executable userspace memory region of the given size.
+    /// Checks whether the requested userspace range is currently mapped with executable memory protection.
     /// </summary>
     /// <param name="p">Pointer to read from.</param>
     /// <param name="size">Size to read.</param>

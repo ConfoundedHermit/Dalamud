@@ -29,6 +29,8 @@ internal static unsafe class SwapChainHelper
     /// <remarks>
     /// After unwrapping graphics middleware, the cached display pointer may differ from
     /// <see cref="SwapChain.DXGISwapChain"/>.
+    /// This pointer is borrowed; callers must not release it. Unwrapping replaces only the cached pointer,
+    /// not the game's swap-chain field.
     /// </remarks>
     public static IDXGISwapChain* GameDisplaySwapChain
     {

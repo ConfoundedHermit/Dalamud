@@ -5,13 +5,17 @@ using Dalamud.Bindings.ImGui;
 namespace Dalamud.Interface.ImGuiBackend;
 
 /// <summary>
-/// Owns a deep copy of ImGui draw data in unmanaged native memory, safe for reading from a render thread
-/// that may run concurrently with the next ImGui update step.
+/// Owns unmanaged copies of the draw-data header and command, index, and vertex buffers.
 /// </summary>
 /// <remarks>
 /// <para>
+/// Readers must be excluded while the snapshot is copied or disposed. Texture handles and callback data remain
+/// borrowed and must stay valid until no render can use the snapshot. Draw callbacks may execute repeatedly and
+/// on a presentation worker thread.
+/// </para>
+/// <para>
 /// The only fields of each <see cref="ImDrawList"/> that are populated are the three that the DX11 renderer
-/// reads: CmdBuffer, IdxBuffer and VtxBuffer. All other fields are zeroed.
+/// reads: CmdBuffer, IdxBuffer and VtxBuffer. All other fields are zeroed, including in lists passed to callbacks.
 /// </para>
 /// </remarks>
 internal sealed unsafe class DrawDataSnapshot : IDisposable
