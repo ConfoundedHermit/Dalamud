@@ -1,0 +1,32 @@
+name: Sync upstream Dalamud
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # Every six hours, in UTC.
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    if: github.repository == 'ConfoundedHermit/DalamudPlus' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.FORK_AUTOMATION_TOKEN || github.token }}
+
+      - name: Mirror upstream and prepare integration PR
+        env:
+          GH_TOKEN: ${{ secrets.FORK_AUTOMATION_TOKEN || github.token }}
+        run: python3 .github/sync_upstream.py --repository "$GITHUB_REPOSITORY"

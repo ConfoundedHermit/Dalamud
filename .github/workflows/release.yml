@@ -1,4 +1,4 @@
-name: Release Dalamud
+name: Release Dalamud Plus
 
 on:
   release:
@@ -11,6 +11,7 @@ concurrency:
 jobs:
   release:
     name: Build and upload Windows release
+    if: github.repository == 'ConfoundedHermit/DalamudPlus' && startsWith(github.event.release.tag_name, 'dalamud-plus/v')
     runs-on: windows-2025
     permissions:
       contents: write
@@ -19,12 +20,31 @@ jobs:
         shell: pwsh
     steps:
       - name: Checkout release commit
-        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ github.sha }}
           submodules: recursive
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Verify fork release provenance
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if (-not $env:RELEASE_TAG.StartsWith('dalamud-plus/v', [StringComparison]::Ordinal)) {
+            throw 'Fork release tags must start with dalamud-plus/v.'
+          }
+
+          $tagCommit = git rev-parse --verify "refs/tags/$($env:RELEASE_TAG)^{commit}"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the release tag.' }
+          $checkoutCommit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the checkout commit.' }
+          if ($tagCommit -ne $checkoutCommit) { throw 'The checkout does not match the release tag.' }
+
+          git merge-base --is-ancestor 67116866f0e8fc0bd6d3aa753bdc2cee96ee8613 $tagCommit
+          if ($LASTEXITCODE -ne 0) { throw 'The release must include the fork integration commit.' }
+          git merge-base --is-ancestor $tagCommit refs/remotes/origin/main
+          if ($LASTEXITCODE -ne 0) { throw 'The release commit must belong to main.' }
 
       - name: Setup .NET
         uses: actions/setup-dotnet@55ec9447dda3d1cf6bd587150f3262f30ee10815 # v3

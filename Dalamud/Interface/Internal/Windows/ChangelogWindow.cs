@@ -460,8 +460,8 @@ internal sealed class ChangelogWindow : Window, IDisposable
                         break;
 
                     case State.Links:
-                        ImGui.TextWrapped("If you note any issues or need help, please check the FAQ, and reach out on our Discord if you need help."u8);
-                        ImGui.TextWrapped("Enjoy your time with the game and Dalamud!"u8);
+                        ImGui.TextWrapped("For help with Dalamud Plus, please report issues in the fork repository. The upstream FAQ covers shared Dalamud features."u8);
+                        ImGui.TextWrapped("Enjoy your time with the game and Dalamud Plus!"u8);
 
                         ImGuiHelpers.ScaledDummy(45);
 
@@ -483,7 +483,7 @@ internal sealed class ChangelogWindow : Window, IDisposable
 
                         ImGuiHelpers.CenterCursorFor(
                             (int)(ImGuiComponents.GetIconButtonWithTextWidth(FontAwesomeIcon.Globe, "See the FAQ") +
-                            ImGuiComponents.GetIconButtonWithTextWidth(FontAwesomeIcon.LaughBeam, "Join our Discord server") +
+                            ImGuiComponents.GetIconButtonWithTextWidth(FontAwesomeIcon.LaughBeam, "Dalamud Plus issues") +
                             (5 * ImGuiHelpers.GlobalScale) +
                             (ImGui.GetStyle().ItemSpacing.X * 4)));
                         if (ImGuiComponents.IconButtonWithText(FontAwesomeIcon.Globe, "See the FAQ"))
@@ -495,14 +495,14 @@ internal sealed class ChangelogWindow : Window, IDisposable
                         ImGuiHelpers.ScaledDummy(5);
                         ImGui.SameLine();
 
-                        if (ImGuiComponents.IconButtonWithText(FontAwesomeIcon.LaughBeam, "Join our Discord server"))
+                        if (ImGuiComponents.IconButtonWithText(FontAwesomeIcon.LaughBeam, "Dalamud Plus issues"))
                         {
-                            Util.OpenLink("https://discord.gg/3NMcUV5");
+                            Util.OpenLink("https://github.com/ConfoundedHermit/DalamudPlus/issues");
                         }
 
                         ImGuiHelpers.ScaledDummy(5);
 
-                        if (CenteredIconButton(FontAwesomeIcon.Heart, "Support what we care about"))
+                        if (CenteredIconButton(FontAwesomeIcon.Heart, "Upstream support and causes"))
                         {
                             Util.OpenLink("https://goatcorp.github.io/faq/support");
                         }

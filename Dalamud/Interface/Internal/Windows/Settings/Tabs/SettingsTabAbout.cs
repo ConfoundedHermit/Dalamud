@@ -208,12 +208,13 @@ Please see licenses.txt for more information.
 
 
 Thanks to everyone in the XIVLauncher Discord server!
-Join us at: https://discord.gg/3NMcUV5
+Upstream community: https://discord.gg/3NMcUV5
 
 
 
 Dalamud is licensed under AGPL v3 or later.
-Contribute at: https://github.com/goatcorp/Dalamud
+Dalamud Plus source and support: https://github.com/ConfoundedHermit/DalamudPlus
+Upstream source: https://github.com/goatcorp/Dalamud
 ";
 
     private readonly Stopwatch creditsThrottler;

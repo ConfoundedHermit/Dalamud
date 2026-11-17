@@ -1,32 +1,44 @@
-name: Back up code to other forges
+name: Back up fork branches and tags
 
 on:
   schedule:
-    - cron: '0 2 * * *'  # Run every day at 2 AM
-  workflow_dispatch:  # Allow manual trigger
+    - cron: '0 */6 * * *' # Every six hours, in UTC.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-mirror-backup
+  cancel-in-progress: false
 
 jobs:
   push-to-forges:
+    if: >-
+      github.repository == 'ConfoundedHermit/DalamudPlus' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' || vars.ENABLE_MIRROR_BACKUP == 'true')
     runs-on: ubuntu-latest
-    if: github.repository == 'goatcorp/Dalamud'
-    
+    timeout-minutes: 30
+    env:
+      MIRROR_GITLAB_URL: ${{ vars.MIRROR_GITLAB_URL }}
+      MIRROR_CODEBERG_URL: ${{ vars.MIRROR_CODEBERG_URL }}
     steps:
-      - name: Checkout the repository
-        uses: actions/checkout@v4
+      - name: Checkout fork
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          ref: main
           fetch-depth: 0
-
-      - uses: webfactory/ssh-agent@a6f90b1f127823b31d4d4a8d96047790581349bd #v0.9.1
+          persist-credentials: false
+      - name: Validate fork-owned destinations
+        run: python3 tools/mirror-fork.py --validate-only
+      - name: Load mirror SSH keys
+        uses: webfactory/ssh-agent@a6f90b1f127823b31d4d4a8d96047790581349bd # v0.9.1
         with:
           ssh-private-key: |
             ${{ secrets.MIRROR_GITLAB_SYNC_KEY }}
             ${{ secrets.MIRROR_CODEBERG_SYNC_KEY }}
-
-      - name: Add remotes & push
+      - name: Push branches and tags without rewriting history
         env:
-          GIT_SSH_COMMAND: "ssh -o StrictHostKeyChecking=accept-new"
-        run: |
-          git remote add gitlab git@gitlab.com:goatcorp/Dalamud.git
-          git push gitlab --all --force
-          git remote add codeberg git@codeberg.org:goatcorp/Dalamud.git
-          git push codeberg --all --force
+          GIT_SSH_COMMAND: ssh -o StrictHostKeyChecking=accept-new
+        run: python3 tools/mirror-fork.py

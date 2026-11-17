@@ -1,74 +1,42 @@
-name: Check for Submodule Changes
-on: 
+name: Check fork submodule updates
+
+on:
   schedule:
-    - cron: "0 0,6,12,18 * * *"
+    - cron: '0 */6 * * *' # Every six hours, in UTC.
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-submodule-updates
+  cancel-in-progress: false
 
 jobs:
   check:
-    name: Check ${{ matrix.submodule.name }}
+    if: >-
+      github.repository == 'ConfoundedHermit/DalamudPlus' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' || vars.ENABLE_SUBMODULE_UPDATES == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
     strategy:
       fail-fast: false
       matrix:
-        branches: [master]
-        submodule:
-          - name: ClientStructs
-            path: lib/FFXIVClientStructs
-            branch: main
-            branch-prefix: csupdate
-          - name: Excel Schema
-            path: lib/Lumina.Excel
-            branch: master
-            branch-prefix: schemaupdate
-
-    defaults: 
-      run:
-        shell: bash
-
+        submodule: [clientstructs, excel]
     steps:
-    - name: Checkout
-      uses: actions/checkout@v3
-      with:
-        submodules: true
-        ref: ${{ matrix.branches }}
-        token: ${{ secrets.UPDATE_PAT }}
-    - name: Create update branch
-      run: git checkout -b ${{ matrix.submodule.branch-prefix }}/${{ matrix.branches }}
-    - name: Initialize mandatory git config
-      run: |
-        git config --global user.name "github-actions[bot]"
-        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        git config --global pull.rebase false
-    - name: Update submodule
-      id: update-submodule
-      run: |
-        git checkout -b ${{ matrix.submodule.branch-prefix }}-${{ matrix.branches }}
-        git reset --hard origin/${{ matrix.branches }}
-        cd ${{ matrix.submodule.path }}
-        git fetch
-        git reset --hard origin/${{ matrix.submodule.branch }}
-        cd ../..
-        git add ${{ matrix.submodule.path }}
-
-        if [[ -z "$(git status --porcelain --untracked-files=no)" ]]; then   
-          echo "No changes detected!"
-          echo "SUBMIT_PR=false" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-        
-        git commit --message "Update ${{ matrix.submodule.name }}"
-        git push origin ${{ matrix.submodule.branch-prefix }}-${{ matrix.branches }} --force
-        echo "SUBMIT_PR=true" >> "$GITHUB_OUTPUT"
-        
-    - name: Create PR
-      if: ${{ steps.update-submodule.outputs.SUBMIT_PR == 'true' }}
-      run: |
-        echo ${{ secrets.UPDATE_PAT }} | gh auth login --with-token
-        prNumber=$(gh pr list --base ${{ matrix.branches }} --head ${{ matrix.submodule.branch-prefix }}-${{ matrix.branches }} --state open --json number --template "{{range .}}{{.number}}{{end}}")
-        if [ -z "$prNumber" ]; then
-          echo "No PR found, creating one"
-          gh pr create --head ${{ matrix.submodule.branch-prefix }}-${{ matrix.branches }} --title "[${{ matrix.branches }}] Update ${{ matrix.submodule.name }}" --body "" --base ${{ matrix.branches }}
-        else
-          echo "PR already exists, ignoring"
-        fi
+      - name: Checkout fork main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.FORK_AUTOMATION_TOKEN || github.token }}
+      - name: Prepare dependency update PR
+        env:
+          GH_TOKEN: ${{ secrets.FORK_AUTOMATION_TOKEN || github.token }}
+          FORK_REPOSITORY: ${{ github.repository }}
+          SUBMODULE: ${{ matrix.submodule }}
+        run: python3 tools/update-fork-submodule.py --submodule "$SUBMODULE" --repository "$FORK_REPOSITORY"

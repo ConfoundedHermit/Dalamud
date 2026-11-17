@@ -1,5 +1,8 @@
-name: Build Dalamud
+name: Build Dalamud Plus
 on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
 
 concurrency:
   group: build_dalamud_${{ github.ref_name }}
@@ -8,10 +11,6 @@ concurrency:
 jobs:
   build:
     name: Build on Windows (${{ matrix.configuration }})
-    permissions:
-      id-token: write
-      contents: read
-      attestations: write
     runs-on: windows-2025
     strategy:
       fail-fast: false
@@ -21,8 +20,8 @@ jobs:
       CONFIGURATION: ${{ matrix.configuration }}
       IS_RELEASE: ${{ matrix.configuration == 'Release' }}
     steps:
-      - name: Checkout Dalamud
-        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+      - name: Checkout Dalamud Plus
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           submodules: recursive
           fetch-depth: 0
@@ -48,27 +47,9 @@ jobs:
           dotnet build Dalamud.Injector/Dalamud.Injector.csproj -c $env:CONFIGURATION -tl:off "/clp:NoSummary;ForceNoAlign"
       - name: Test Dalamud
         run: dotnet test Dalamud.Test/Dalamud.Test.csproj -c $env:CONFIGURATION -tl:off -p:WarningLevel=0
-      - name: Sign Dalamud
-        if: ${{ env.IS_RELEASE == 'true' && github.repository_owner == 'goatcorp' && github.event_name == 'push' }}
-        env:
-          CODESIGN_CERT_PFX: ${{ secrets.CODESIGN_CERT_PFX }}
-          CODESIGN_CERT_PASSWORD: ${{ secrets.CODESIGN_CERT_PASSWORD }}
-        run: .\tools\sign.ps1 .\bin\Release
       - name: Create hashlist
         if: ${{ env.IS_RELEASE == 'true' }}
         run: .\tools\create_hashlist.ps1 .\bin\Release
-      - name: Attest Build
-        if: ${{ env.IS_RELEASE == 'true' && github.repository_owner == 'goatcorp' && github.event_name == 'push' }}
-        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
-        with:
-          subject-path: |
-            bin/Release/hashes.json
-            bin/Release/Dalamud.dll
-            bin/Release/DalamudCrashHandler.exe
-            bin/Release/Dalamud.*.dll
-            bin/Release/Dalamud.*.exe
-            bin/Release/FFXIVClientStructs.dll
-            bin/Release/cim*.dll
       - name: Upload artifact
         if: ${{ env.IS_RELEASE == 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -85,7 +66,7 @@ jobs:
     - name: "Install .NET SDK"
       uses: actions/setup-dotnet@55ec9447dda3d1cf6bd587150f3262f30ee10815 # v3
       with:
-        dotnet-version: 7
+        dotnet-version: '10.0.100'
     - name: "Install ApiCompat"
       run: |
         dotnet tool install -g Microsoft.DotNet.ApiCompat.Tool
@@ -94,7 +75,7 @@ jobs:
       with:
         name: dalamud-artifact
         path: .\right
-    - name: "Download Live (Stg) Artifacts"
+    - name: "Download upstream API baseline"
       run: |
           Invoke-WebRequest -Uri https://goatcorp.github.io/dalamud-distrib/stg/latest.zip -OutFile latest.zip
           Expand-Archive -Force latest.zip "left"
@@ -116,73 +97,3 @@ jobs:
         }
 
         exit $retcode
-
-  deploy_stg:
-    name: Deploy dalamud-distrib staging
-    if: ${{ github.repository_owner == 'goatcorp' && github.event_name == 'push' }}
-    needs: build
-    runs-on: windows-latest
-    steps:
-    - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
-      with:
-        repository: goatcorp/dalamud-distrib
-        token: ${{ secrets.UPDATE_PAT }}
-    - uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.1.7
-      with:
-        name: dalamud-artifact
-        path: .\scratch
-
-    - name: Extract branch name
-      shell: bash
-      run: echo "##[set-output name=branch;]$(echo ${GITHUB_REF#refs/heads/})"
-      id: extract_branch
-
-    - name: Generate dalamud-distrib version file
-      shell: pwsh
-      env:
-        GH_BRANCH: ${{ steps.extract_branch.outputs.branch }}
-      run: |
-        Compress-Archive .\scratch\* .\canary.zip  # Recreate the release zip
-
-        $branchName = $env:GH_BRANCH
-
-        if ($branchName -eq "master") {
-          $branchName = "stg"
-        }
-
-        $newVersion = [System.IO.File]::ReadAllText("$(Get-Location)\scratch\TEMP_gitver.txt")
-        $revision = [System.IO.File]::ReadAllText("$(Get-Location)\scratch\revision.txt")
-        $commitHash = [System.IO.File]::ReadAllText("$(Get-Location)\scratch\commit_hash.txt")
-        Remove-Item -Force -Recurse .\scratch
-
-        if (Test-Path -Path $branchName) {
-            $versionData = Get-Content ".\${branchName}\version" | ConvertFrom-Json
-            $oldVersion = $versionData.AssemblyVersion
-            if ($oldVersion -eq $newVersion) {
-              Remove-Item .\canary.zip
-            } else {
-              Move-Item -Force ".\canary.zip" ".\${branchName}\latest.zip"
-              $versionData.AssemblyVersion = $newVersion
-              $versionData | add-member -Force -Name "GitSha" $commitHash -MemberType NoteProperty
-              $versionData | add-member -Force -Name "Revision" $revision -MemberType NoteProperty
-              $versionData | ConvertTo-Json -Compress | Out-File ".\${branchName}\version"
-            }
-
-            echo "DVER=${newVersion}" >> $Env:GITHUB_ENV
-        } else {
-            Write-Host "Deployment folder doesn't exist. Not doing anything."
-            Remove-Item .\canary.zip
-        }
-
-    - name: Commit changes
-      shell: bash
-      env:
-        GH_BRANCH: ${{ steps.extract_branch.outputs.branch }}
-      run: |
-        git config --global user.name "Actions User"
-        git config --global user.email "actions@github.com"
-
-        git add .
-        git commit -m "[CI] Update staging for ${DVER} on ${GH_BRANCH}" || true
-
-        git push origin main || true
