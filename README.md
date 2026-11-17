@@ -18,9 +18,41 @@ Upstream changes are merged into `main` through the clean `master` branch. Fork 
 
 ## Running the fork
 
-Dalamud is normally loaded by [XIVLauncher](https://github.com/goatcorp/FFXIVQuickLauncher) or a compatible launcher, which manages required runtime dependencies. Using Dalamud Plus requires explicitly selecting a fork build through the launcher's Dalamud directory override.
+Dalamud is normally loaded by [XIVLauncher](https://github.com/goatcorp/FFXIVQuickLauncher) or a compatible launcher, which manages required runtime dependencies. To test Dalamud Plus, use the fork's injector as described below, or select the extracted build through your launcher's Dalamud directory override. Fork builds are updated manually; this repository does not provide an automatic launcher update channel.
 
-Fork release bundles retain the `Dalamud-win-x64.zip` filename and existing DLL names for launcher and plugin compatibility. The framework runs inside the Windows x64 game process, including through Wine on Linux and macOS. The local validation recorded for the integration covers Windows builds and tests; in-game and Wine checks remain separate.
+The injection instructions below use XIVLauncher on Windows. The framework also runs inside the Windows x64 game process through Wine on Linux and macOS. On those hosts, select the fork build using your launcher's supported configuration within its Wine environment. The local validation recorded for the integration covers Windows builds and tests; in-game and Wine checks remain separate.
+
+### Download a test build
+
+Download `Dalamud-win-x64.zip` from the [Dalamud Plus releases](https://github.com/ConfoundedHermit/DalamudPlus/releases) page and extract it into a dedicated directory, separate from launcher-managed files.
+
+The ZIP contains the Windows/x64 Release build, native libraries, managed dependencies, debug symbols, and `hashes.json`. `Dalamud.dll` and `Dalamud.Injector.exe` are at the ZIP root. The separate `Dalamud-win-x64.zip.sha256` asset provides the archive's SHA-256 checksum. These are unsigned test builds. The archive and DLL names retain their existing identities for launcher and plugin compatibility.
+
+Keep the release tag or commit when reporting a problem. Fork release tags use `dalamud-plus/vYYYYMMDD`, with an optional same-day sequence suffix; the numeric Dalamud assembly version alone does not identify the fork release.
+
+### Automatic injection (Windows/XIVLauncher)
+
+1. Open XIVLauncher, go to **Settings > Dalamud**, and uncheck **Enable Dalamud**.
+2. Go to **Auto-launch > Add new** and select `Dalamud.Injector.exe` in your extracted directory.
+3. Start the game through XIVLauncher as normal and verify that Dalamud and your plugins load.
+
+To return to launcher-managed Dalamud, remove or disable the injector's Auto-launch entry and re-enable **Enable Dalamud**.
+
+### Manual injection (Windows/XIVLauncher)
+
+Start the game through XIVLauncher using **Start w/o Dalamud** (right-click **Log in**). If you configured automatic injection above, disable that Auto-launch entry for a manual test. Once the game is running, open PowerShell in the extracted directory and run:
+
+```powershell
+.\Dalamud.Injector.exe inject -a
+```
+
+Verify that Dalamud and your plugins load. See the upstream [manual injection guide](https://dalamud.dev/building/#manual-injection) for additional details.
+
+## For best experience (Windows 11)
+
+When playing FFXIV in windowed or borderless windowed mode, enable **Optimizations for windowed games** in **Windows Settings > System > Display > Graphics**. Check the `ffxiv_dx11.exe` entry under **Custom settings for applications** (called **Custom options for apps** on some Windows versions) and ensure the setting is enabled for the game. Restart FFXIV after changing it.
+
+This setting moves compatible DirectX 10/11 games to the modern flip presentation model, reducing presentation latency and enabling modern display features. See [Microsoft's windowed games optimization guide](https://support.microsoft.com/en-us/windows/hardware/display-graphics/optimizations-for-windowed-games-in-windows-11). Check this setting when testing Smooth Motion; if you encounter stuttering, latency spikes, or inconsistent frame delivery, include its state in your issue report.
 
 ## Building and testing locally
 
@@ -39,7 +71,9 @@ The [upstream build documentation](https://dalamud.dev/building) provides additi
 Dalamud features a growing API for in-game plugin development with game data and chat access and overlays.
 The [upstream Developer FAQ](https://goatcorp.github.io/faq/development) and [API documentation](https://dalamud.dev) describe the shared plugin API.
 
-Report fork issues and discuss changes in [Dalamud Plus issues](https://github.com/ConfoundedHermit/DalamudPlus/issues). Include the fork commit, launcher, host OS, graphics setup, and reproduction steps. Fork support is maintained in this repository.
+## Reporting issues
+
+Report problems using the [Dalamud Plus bug report form](https://github.com/ConfoundedHermit/DalamudPlus/issues/new?template=bug_report.yml), suggest improvements with the [feature request form](https://github.com/ConfoundedHermit/DalamudPlus/issues/new?template=feature_request.yml), or discuss changes in [Dalamud Plus issues](https://github.com/ConfoundedHermit/DalamudPlus/issues). For bug reports, include the fork release tag or commit, launcher, host OS, graphics setup, and reproduction steps. Fork support is maintained in this repository.
 
 <br>
 

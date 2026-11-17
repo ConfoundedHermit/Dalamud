@@ -1,0 +1,79 @@
+name: Bug report
+description: Report a problem with Dalamud Plus.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing Dalamud Plus. Check the [running instructions](https://github.com/ConfoundedHermit/DalamudPlus#running-the-fork) and [existing issues](https://github.com/ConfoundedHermit/DalamudPlus/issues) before reporting a problem.
+        Include the exact fork release or commit so we can identify the build you tested.
+
+  - type: input
+    id: build
+    attributes:
+      label: Fork release or commit
+      description: The release tag or full commit SHA. The numeric Dalamud version alone does not identify a fork release.
+      placeholder: "dalamud-plus/v20261116-2, or a commit SHA for a local build"
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened, and what did you expect?
+      description: Describe the problem and the expected behavior. Include any error message, when the problem started, and the last working fork release if known.
+      placeholder: |
+        Actual behavior:
+        Expected behavior:
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include how often it happens and any specific plugin, game action, or window operation involved.
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and injection method
+      description: Include your launcher and its version, how you loaded the fork, and the game version. For Linux or macOS, include the Wine/Proton/CrossOver version and graphics translation layer, if known.
+      placeholder: |
+        Host OS and version:
+        FFXIV version:
+        Launcher and version:
+        Injection method (auto-launch, manual, or directory override):
+        GPU and driver version:
+        Wine/compatibility stack and graphics translation (if applicable):
+    validations:
+      required: true
+
+  - type: textarea
+    id: graphics
+    attributes:
+      label: Graphics and presentation settings
+      description: For rendering, stuttering, input, or window problems, include the settings below. Mark anything that does not apply.
+      placeholder: |
+        Window mode (windowed, borderless, or fullscreen):
+        Smooth Motion or other frame generation (enabled/disabled, version if known):
+        ReShade (version and addons, or not installed):
+        Windows Optimizations for windowed games (on/off/not applicable):
+        Other overlays or graphics tools:
+
+  - type: textarea
+    id: plugins
+    attributes:
+      label: Plugins and comparison checks
+      description: List relevant plugins and versions. If you tried disabling plugins or comparing with upstream Dalamud or another fork release, describe the result. Leave untested comparisons marked as untested.
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, screenshots, or other evidence
+      description: Attach relevant Dalamud/launcher logs, error details, screenshots, or a short recording. Note the time of the problem and remove personal information before uploading.

@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest an improvement to Dalamud Plus.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form to suggest improvements to Dalamud Plus. Check [existing issues](https://github.com/ConfoundedHermit/DalamudPlus/issues) for related requests and add your use case there if one already covers it.
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Problem or use case
+      description: What are you trying to do, and what limitation or missing capability gets in the way? Describe a concrete example and who would benefit.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe how you would like Dalamud Plus to behave. An example of the desired result helps; implementation details are optional.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or workarounds
+      description: Describe any existing settings, plugins, or other approaches you considered or tried, and how well they meet your needs.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add supporting links, screenshots, or mockups. Mention relevant plugins, host OS, graphics setup, or compatibility considerations if they affect the request.
