@@ -169,23 +169,27 @@ public class InterfaceShutdownTests
         using var fixture = new ShutdownFixture();
         var framework = (Framework)fixture.GetField("framework")!;
         using var dispatcher = new FrameworkDispatcher(framework);
-        using var originalEntered = new ManualResetEventSlim();
+        // Let the test coordinator yield its pool thread while queued unload work makes progress.
+        var originalEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var hooksDetached = new ManualResetEventSlim();
-        using var frameworkWorkRan = new ManualResetEventSlim();
+        var frameworkWorkRan = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var releaseOriginal = new ManualResetEventSlim();
-        using var unloadReturned = new ManualResetEventSlim();
+        var unloadReturned = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var resourcesDisposed = new ManualResetEventSlim();
         using var followingServiceDisposed = new ManualResetEventSlim();
-        using var windowCallbackEntered = new ManualResetEventSlim();
+        var windowCallbackEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var releaseWindowCallback = new ManualResetEventSlim();
         var order = new ConcurrentQueue<string>();
         var hook = fixture.InstallHook("dxgiSwapChainPresentHook", "dxgiSwapChainPresentFallback", () =>
         {
-            originalEntered.Set();
+            originalEntered.TrySetResult();
             Assert.True(hooksDetached.Wait(WorkerTimeout), "Service unload did not detach interception.");
 
             // Native Present may need the framework/window thread before it can return.
-            var frameworkWork = framework.RunOnFrameworkThread(() => frameworkWorkRan.Set());
+            var frameworkWork = framework.RunOnFrameworkThread(() =>
+            {
+                frameworkWorkRan.TrySetResult();
+            });
             Assert.True(frameworkWork.Wait(WorkerTimeout), "The drain prevented native-dependent framework work.");
             Assert.True(releaseOriginal.Wait(WorkerTimeout), "The original continuation was not released.");
         }, () => throw new InvalidOperationException("Unexpected native fallback before drain."));
@@ -203,7 +207,7 @@ public class InterfaceShutdownTests
 
         try
         {
-            Assert.True(originalEntered.Wait(WorkerTimeout), "The presentation worker did not enter its native continuation.");
+            await originalEntered.Task.WaitAsync(WorkerTimeout);
 
             Task BeginUnload()
             {
@@ -234,13 +238,13 @@ public class InterfaceShutdownTests
                         return Task.CompletedTask;
                     },
                 ]);
-                unloadReturned.Set();
+                unloadReturned.TrySetResult();
                 return result;
             }
 
             unload = startOnFrameworkThread ? framework.RunOnFrameworkThread(BeginUnload) : Task.Run(BeginUnload);
-            Assert.True(unloadReturned.Wait(WorkerTimeout), "Starting service unload synchronously blocked its caller.");
-            Assert.True(frameworkWorkRan.Wait(WorkerTimeout), "The framework could not service the native continuation while draining.");
+            await unloadReturned.Task.WaitAsync(WorkerTimeout);
+            await frameworkWorkRan.Task.WaitAsync(WorkerTimeout);
             Assert.False(worker.IsCompleted);
             Assert.False(unload.IsCompleted);
             Assert.False(hook.IsDisposed);
@@ -250,11 +254,11 @@ public class InterfaceShutdownTests
             // Secondary WndProc callbacks are outside the hook drain; owner-thread dispatch must serialize teardown.
             windowCallback = framework.RunOnFrameworkThread(() =>
             {
-                windowCallbackEntered.Set();
+                windowCallbackEntered.TrySetResult();
                 Assert.True(releaseWindowCallback.Wait(WorkerTimeout), "The owner-thread operation was not released.");
                 Assert.False(resourcesDisposed.IsSet);
             });
-            Assert.True(windowCallbackEntered.Wait(WorkerTimeout));
+            await windowCallbackEntered.Task.WaitAsync(WorkerTimeout);
             releaseOriginal.Set();
             await worker.WaitAsync(WorkerTimeout);
             await ((Task)fixture.GetField("hookCleanupTask")!).WaitAsync(WorkerTimeout);

@@ -9,6 +9,7 @@ using Dalamud.Game.ClientState.GamePad;
 using Dalamud.Interface.Colors;
 using Dalamud.Interface.Internal.DesignSystem;
 using Dalamud.Interface.Internal.Windows.Settings.Tabs;
+using Dalamud.Interface.Internal.Windows.Settings.Widgets;
 using Dalamud.Interface.ManagedFontAtlas.Internals;
 using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
@@ -171,12 +172,22 @@ internal sealed class SettingsWindow : Window
             }
         }
 
-        var hasInvalidEntries = this.tabs.Any(x => x.Entries.Any(y => !y.IsValid));
+        // Advance submitted path checks independently of field visibility before evaluating Save.
+        var hasPendingDevPluginEdits = false;
+        foreach (var entry in this.tabs.SelectMany(tab => tab.Entries).OfType<DevPluginsSettingsEntry>())
+        {
+            entry.AdvancePendingEdits();
+            hasPendingDevPluginEdits |= !entry.IsValid;
+        }
+
+        var hasInvalidEntries = hasPendingDevPluginEdits || this.tabs.Any(x => x.Entries.Any(y => !y.IsValid));
 
         if (DalamudComponents.DrawFloatingSaveDiscardButtons(
                 out var saveClicked,
                 saveDisabled: hasInvalidEntries,
-                saveDisabledTooltip: Loc.Localize("DalamudSettingsSaveBlocked", "Some settings have invalid values and cannot be saved.")))
+                saveDisabledTooltip: hasPendingDevPluginEdits
+                                         ? Loc.Localize("DalamudSettingsSaveDevPluginCheckPending", "A Dev Plugin path change is being checked. Open Dev Plugin Locations to review or cancel it.")
+                                         : Loc.Localize("DalamudSettingsSaveBlocked", "Some settings have invalid values and cannot be saved.")))
         {
             this.IsOpen = false;
         }
