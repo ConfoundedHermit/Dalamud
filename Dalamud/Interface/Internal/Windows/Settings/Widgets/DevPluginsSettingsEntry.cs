@@ -1,9 +1,8 @@
-using System.Collections.Generic;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
-using System.IO;
 using System.Linq;
 using System.Numerics;
-using System.Threading.Tasks;
+using System.Runtime.CompilerServices;
 
 using CheapLoc;
 
@@ -21,16 +20,19 @@ using Dalamud.Utility.Internal;
 
 namespace Dalamud.Interface.Internal.Windows.Settings.Widgets;
 
+/// <summary>
+/// Edits dev plugin load locations and displays asynchronous path validation results.
+/// </summary>
 [SuppressMessage("StyleCop.CSharp.DocumentationRules", "SA1600:Elements should be documented", Justification = "Internals")]
 internal sealed class DevPluginsSettingsEntry : SettingsEntry
 {
     private readonly FileDialogManager fileDialogManager = new();
+    private readonly DevPluginLocationEditor editor = new();
     private readonly Func<bool>? checkVisibility;
 
-    private List<DevPluginLocationSettings> devPluginLocations = [];
-    private bool devPluginLocationsChanged;
     private string devPluginTempLocation = string.Empty;
     private string devPluginLocationAddError = string.Empty;
+    private long addErrorTimestamp;
     private bool hadDevPlugins;
 
     public DevPluginsSettingsEntry(Func<bool>? visibility = null)
@@ -41,31 +43,39 @@ internal sealed class DevPluginsSettingsEntry : SettingsEntry
 
     public override bool IsVisible => this.IsDevModeEnabled || this.hadDevPlugins;
 
+    // Filesystem warnings on accepted locations do not block saving; unresolved path changes do.
+    public override bool IsValid => !this.editor.HasPendingEdits;
+
     private bool IsDevModeEnabled => this.checkVisibility?.Invoke() ?? true;
+
+    /// <summary>Advances submitted edits while the settings window is open, including when this field is hidden.</summary>
+    public void AdvancePendingEdits() => this.editor.AdvancePendingEdits();
 
     public override void OnClose()
     {
-        this.devPluginLocations =
-            [.. Service<DalamudConfiguration>.Get().DevPluginLoadLocations.Select(x => x.Clone())];
+        this.Load();
     }
 
     public override void Load()
     {
-        this.devPluginLocations =
-            [.. Service<DalamudConfiguration>.Get().DevPluginLoadLocations.Select(x => x.Clone())];
-        this.devPluginLocationsChanged = false;
-        if (this.devPluginLocations.Count > 0)
+        this.editor.Reset(Service<DalamudConfiguration>.Get().DevPluginLoadLocations);
+        this.devPluginLocationAddError = string.Empty;
+        this.devPluginTempLocation = string.Empty;
+        if (this.editor.Locations.Count > 0)
             this.hadDevPlugins = true;
     }
 
     public override void Save()
     {
+        if (!this.IsValid)
+            return;
+
         var config = Service<DalamudConfiguration>.Get();
 
         config.DevPluginLoadLocations.RemoveAll(existing =>
-                                                    this.devPluginLocations.All(loc => loc.Path != existing.Path));
+                                                    this.editor.Locations.All(loc => loc.Path != existing.Path));
 
-        foreach (var pendingLocation in this.devPluginLocations)
+        foreach (var pendingLocation in this.editor.Locations)
         {
             var existing = config.DevPluginLoadLocations
                                  .FirstOrDefault(x => x.Path == pendingLocation.Path);
@@ -81,10 +91,10 @@ internal sealed class DevPluginsSettingsEntry : SettingsEntry
             }
         }
 
-        if (this.devPluginLocationsChanged)
+        if (this.editor.Changed)
         {
             _ = Service<PluginManager>.Get().ScanDevPluginsAsync();
-            this.devPluginLocationsChanged = false;
+            this.editor.MarkSaved();
         }
     }
 
@@ -92,8 +102,10 @@ internal sealed class DevPluginsSettingsEntry : SettingsEntry
     {
         using var id = ImRaii.PushId("devPluginLocation"u8);
 
+        this.editor.ConsumeCompleted();
         if (!this.IsDevModeEnabled)
         {
+            this.DrawPendingEditMessage();
             ImGui.TextColoredWrapped(
                 ImGuiColors.AttentionForeground,
                 LazyLoc.Localize(
@@ -103,9 +115,10 @@ internal sealed class DevPluginsSettingsEntry : SettingsEntry
             return;
         }
 
+        this.editor.Refresh();
         ImGui.Text(this.Name);
 
-        if (this.devPluginLocationsChanged)
+        if (this.editor.Changed)
         {
             using (ImRaii.PushColor(ImGuiCol.Text, ImGuiColors.HealerGreen))
             {
@@ -115,6 +128,7 @@ internal sealed class DevPluginsSettingsEntry : SettingsEntry
         }
 
         ImGui.TextColoredWrapped(ImGuiColors.DalamudGrey, Loc.Localize("DalamudSettingsDevPluginLocationsHint", "Add dev plugin load locations.\nThis must be a path to the plugin DLL."));
+        this.DrawPendingEditMessage();
 
         var locationSelect = Loc.Localize("DalamudDevPluginLocationSelect", "Select Dev Plugin DLL");
         if (ImGuiComponents.IconButtonWithText(FontAwesomeIcon.Folder, locationSelect))
@@ -159,33 +173,23 @@ internal sealed class DevPluginsSettingsEntry : SettingsEntry
         DevPluginLocationSettings locationToRemove = null;
 
         var locNumber = 1;
-        foreach (var devPluginLocationSetting in this.devPluginLocations)
+        foreach (var devPluginLocationSetting in this.editor.Locations)
         {
             var isEnabled = devPluginLocationSetting.IsEnabled;
 
-            id.Push(devPluginLocationSetting.Path);
+            // Keep the row identity stable when its accepted path changes.
+            id.Push(RuntimeHelpers.GetHashCode(devPluginLocationSetting));
 
             ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (ImGui.GetColumnWidth() / 2) - 8 - (ImGui.CalcTextSize(locNumber.ToString()).X / 2));
             ImGui.Text(locNumber.ToString());
             ImGui.NextColumn();
 
-            var dllPath = devPluginLocationSetting.Path;
-            var hasError = this.TryGetError(dllPath, out var error);
+            var warning = this.editor.GetWarning(devPluginLocationSetting);
+            var hasError = warning != DevPluginLocationError.None;
+            var error = GetLocationError(warning);
 
             ImGui.SetNextItemWidth(!hasError ? -1 : ImGui.GetContentRegionAvail().X - ImGui.GetFrameHeight() - ImGui.GetStyle().ItemSpacing.X);
-            if (ImGui.InputText($"##devPluginLocationInput", ref dllPath, 65535, ImGuiInputTextFlags.EnterReturnsTrue) && devPluginLocationSetting.Path != dllPath)
-            {
-                if (!this.TryGetError(dllPath, out error))
-                {
-                    devPluginLocationSetting.Path = dllPath;
-                    this.devPluginLocationsChanged = true;
-                }
-                else if (error.Loc.Key is "DalamudDevPluginLocationExists" or "DalamudDevPluginInvalid")
-                {
-                    this.devPluginLocationAddError = error.Loc.ToString();
-                    Task.Delay(5000).ContinueWith(t => this.devPluginLocationAddError = string.Empty);
-                }
-            }
+            DrawPathInput(this.editor, devPluginLocationSetting);
 
             if (hasError)
             {
@@ -194,6 +198,24 @@ internal sealed class DevPluginsSettingsEntry : SettingsEntry
                     error.Loc.ToString(),
                     error.Icon,
                     error.Color ?? Colors.ImGuiColors.WarningForeground);
+            }
+
+            if (this.editor.GetPendingPath(devPluginLocationSetting) is not null)
+            {
+                ImGui.TextColoredWrapped(
+                    ImGuiColors.DalamudGrey,
+                    Loc.Localize("DalamudDevPluginEditCurrentPath", "Current path: {0}").Format(devPluginLocationSetting.Path));
+                ImGui.TextColoredWrapped(
+                    ImGuiColors.AttentionForeground,
+                    Loc.Localize("DalamudDevPluginEditChecking", "Checking the submitted path..."));
+            }
+
+            if (this.editor.GetRejectedEdit(devPluginLocationSetting) is { } rejected)
+            {
+                ImGui.TextColoredWrapped(
+                    ImGuiColors.WarningForeground,
+                    Loc.Localize("DalamudDevPluginEditRejected", "Path change rejected: {0}\n{1}")
+                       .Format(rejected.Path, GetLocationError(rejected.Error).Loc.ToString()));
             }
 
             ImGui.NextColumn();
@@ -231,8 +253,7 @@ internal sealed class DevPluginsSettingsEntry : SettingsEntry
 
         if (locationToRemove != null)
         {
-            this.devPluginLocations.Remove(locationToRemove);
-            this.devPluginLocationsChanged = true;
+            this.editor.Remove(locationToRemove);
         }
 
         ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (ImGui.GetColumnWidth() / 2) - 8 - (ImGui.CalcTextSize(locNumber.ToString()).X / 2));
@@ -241,9 +262,8 @@ internal sealed class DevPluginsSettingsEntry : SettingsEntry
         ImGui.SetNextItemWidth(-1);
         ImGui.InputText("##devPluginLocationInput"u8, ref this.devPluginTempLocation, 300);
         ImGui.NextColumn();
-        // Nickname
+        // New locations start enabled without a nickname.
         ImGui.NextColumn();
-        // Enabled button
         ImGui.NextColumn();
         if (!string.IsNullOrEmpty(this.devPluginTempLocation) && ImGuiComponents.IconButton(FontAwesomeIcon.Plus))
         {
@@ -252,7 +272,7 @@ internal sealed class DevPluginsSettingsEntry : SettingsEntry
 
         ImGui.Columns(1);
 
-        if (!string.IsNullOrEmpty(this.devPluginLocationAddError))
+        if (!string.IsNullOrEmpty(this.devPluginLocationAddError) && Stopwatch.GetElapsedTime(this.addErrorTimestamp) < TimeSpan.FromSeconds(5))
         {
             ImGui.TextColoredWrapped(new Vector4(1, 0, 0, 1), this.devPluginLocationAddError);
         }
@@ -263,75 +283,77 @@ internal sealed class DevPluginsSettingsEntry : SettingsEntry
         this.fileDialogManager.Draw();
     }
 
-    private static bool ValidDevPluginPath(string path)
-        => Path.IsPathRooted(path) && Path.GetExtension(path) == ".dll";
+    /// <summary>Tracks draft text each frame and submits path changes on Enter.</summary>
+    /// <param name="editor">The current settings session.</param>
+    /// <param name="location">The edited location.</param>
+    internal static void DrawPathInput(DevPluginLocationEditor editor, DevPluginLocationSettings location)
+    {
+        using var id = ImRaii.PushId(editor.GetInputRevision(location));
+        var path = editor.GetInputPath(location);
+        var submitted = ImGui.InputText("##devPluginLocationInput"u8, ref path, 65535, ImGuiInputTextFlags.EnterReturnsTrue);
+
+        // EnterReturnsTrue still copies text each frame. Track changes so refocusing preserves pending edits and rejections.
+        editor.SetInputPath(location, path);
+        if (submitted)
+            editor.SubmitEdit(location);
+        // Search may hide the deactivation frame; discard abandoned drafts when the input reappears.
+        else if (ImGui.IsItemDeactivatedAfterEdit() ||
+                 (!ImGui.IsItemActive() && path != location.Path && editor.GetPendingPath(location) is null))
+            editor.DiscardEdit(location);
+    }
+
+    private static LocationError GetLocationError(DevPluginLocationError error)
+        => error switch
+        {
+            DevPluginLocationError.Pending => new(
+                LazyLoc.Localize("DalamudDevPluginLocationChecking", "Checking path..."),
+                FontAwesomeIcon.Clock,
+                ImGuiColors.DalamudGrey),
+            DevPluginLocationError.DllUnavailable => new(LazyLoc.Localize("DalamudDevPluginLocationFileDoesNotExist", "File does not exist.")),
+            DevPluginLocationError.InvalidPath => new(LazyLoc.Localize("DalamudDevPluginInvalid", "The entered value is not a valid path to a potential Dev Plugin.\nDid you mean to enter it as a custom plugin repository in the fields below instead?")),
+            DevPluginLocationError.ManifestUnavailable => new(LazyLoc.Localize("DalamudDevPluginLocationManifestDoesNotExist", "Manifest does not exist.")),
+            DevPluginLocationError.Duplicate => new(LazyLoc.Localize("DalamudDevPluginLocationExists", "Location already exists.")),
+            _ => default,
+        };
 
     private void AddDevPlugin()
     {
-        this.devPluginTempLocation = this.devPluginTempLocation.Trim('"');
-        if (this.devPluginLocations.Any(
-                r => string.Equals(r.Path, this.devPluginTempLocation, StringComparison.InvariantCultureIgnoreCase)))
+        var error = this.editor.Add(this.devPluginTempLocation);
+        if (error == DevPluginLocationError.None)
         {
-            this.devPluginLocationAddError = Loc.Localize("DalamudDevPluginLocationExists", "Location already exists.");
-            Task.Delay(5000).ContinueWith(t => this.devPluginLocationAddError = string.Empty);
-        }
-        else if (!ValidDevPluginPath(this.devPluginTempLocation))
-        {
-            this.devPluginLocationAddError = Loc.Localize(
-                "DalamudDevPluginInvalid",
-                "The entered value is not a valid path to a potential Dev Plugin.\nDid you mean to enter it as a custom plugin repository in the fields below instead?");
-            Task.Delay(5000).ContinueWith(t => this.devPluginLocationAddError = string.Empty);
-            return;
-        }
-        else
-        {
-            this.devPluginLocations.Add(
-                new DevPluginLocationSettings
-                {
-                    Path = this.devPluginTempLocation,
-                    IsEnabled = true,
-                });
-            this.devPluginLocationsChanged = true;
             this.hadDevPlugins = true;
             this.devPluginTempLocation = string.Empty;
         }
+        else
+        {
+            this.devPluginLocationAddError = GetLocationError(error).Loc.ToString();
+            this.addErrorTimestamp = Stopwatch.GetTimestamp();
+            if (error == DevPluginLocationError.InvalidPath)
+                return;
+        }
 
-        // Enable ImGui asserts if a dev plugin is added, if no choice was made prior
+        // Enable ImGui assertions by default for dev plugin use.
         Service<DalamudConfiguration>.Get().ImGuiAssertsEnabledAtStartup ??= true;
     }
 
-    private bool TryGetError(string dllPath, out LocationError error)
+    private void DrawPendingEditMessage()
     {
-        var dllExists = !dllPath.IsNullOrWhitespace() && File.Exists(dllPath);
-        if (!dllExists)
+        if (!this.editor.HasPendingEdits)
+            return;
+
+        ImGui.TextColoredWrapped(
+            ImGuiColors.AttentionForeground,
+            Loc.Localize("DalamudDevPluginEditSavePending", "A Dev Plugin path change is being checked. Save is unavailable until the check finishes."));
+        if (ImGui.SmallButton(Loc.Localize("DalamudDevPluginEditCancel", "Cancel pending path changes")))
         {
-            error = new(LazyLoc.Localize("DalamudDevPluginLocationFileDoesNotExist", "File does not exist."));
-            return true;
+            foreach (var location in this.editor.Locations)
+            {
+                if (this.editor.GetPendingPath(location) is null)
+                    continue;
+
+                this.editor.DiscardEdit(location);
+            }
         }
-
-        if (!ValidDevPluginPath(dllPath))
-        {
-            error = new(LazyLoc.Localize("DalamudDevPluginInvalid", "The entered value is not a valid path to a potential Dev Plugin.\nDid you mean to enter it as a custom plugin repository in the fields below instead?"));
-            return true;
-        }
-
-        var manifestPath = Path.ChangeExtension(dllPath, ".json");
-        var manifestExists = !manifestPath.IsNullOrWhitespace() && File.Exists(manifestPath);
-
-        if (!manifestExists)
-        {
-            error = new(LazyLoc.Localize("DalamudDevPluginLocationManifestDoesNotExist", "Manifest does not exist."));
-            return true;
-        }
-
-        if (this.devPluginLocations.Count(loc => loc.Path == dllPath) > 1)
-        {
-            error = new(LazyLoc.Localize("DalamudDevPluginLocationExists", "Location already exists."));
-            return true;
-        }
-
-        error = default;
-        return false;
     }
 
     private record struct LocationError(LazyLoc Loc, FontAwesomeIcon Icon = FontAwesomeIcon.ExclamationTriangle, Vector4? Color = null);
