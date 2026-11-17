@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -20,7 +21,7 @@ public class DevPluginLocationEditorTests
     [Fact]
     public async Task PendingEditAndPollingReturnWhileTheProbeIsBlocked()
     {
-        using var probeEntered = new ManualResetEventSlim();
+        var probeEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var releaseProbe = new ManualResetEventSlim();
         var workerThreads = new ConcurrentBag<int>();
         var uiThread = 0;
@@ -29,7 +30,7 @@ public class DevPluginLocationEditorTests
             workerThreads.Add(Environment.CurrentManagedThreadId);
             if (path == CandidatePath)
             {
-                probeEntered.Set();
+                probeEntered.TrySetResult();
                 Assert.True(releaseProbe.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
             }
 
@@ -53,7 +54,7 @@ public class DevPluginLocationEditorTests
             }, TestContext.Current.CancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
             await uiWork.WaitAsync(WorkerTimeout, TestContext.Current.CancellationToken);
-            Assert.True(probeEntered.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
+            await probeEntered.Task.WaitAsync(WorkerTimeout, TestContext.Current.CancellationToken);
             Assert.DoesNotContain(uiThread, workerThreads);
             Assert.False(editor.Changed);
             Assert.Equal(CandidatePath, editor.GetPendingPath(editor.Locations[0]));
@@ -63,14 +64,14 @@ public class DevPluginLocationEditorTests
             releaseProbe.Set();
         }
 
-        PollUntil(editor, () => !editor.HasPendingEdits, refresh: false);
+        await PollUntilAsync(editor, () => !editor.HasPendingEdits, refresh: false);
         Assert.Equal(CandidatePath, editor.Locations[0].Path);
     }
 
     [Fact]
-    public void ValidityPollingCommitsSuccessfulEditsWithoutSchedulingMoreWork()
+    public async Task ValidityPollingCommitsSuccessfulEditsWithoutSchedulingMoreWork()
     {
-        using var candidateEntered = new ManualResetEventSlim();
+        var candidateEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var releaseCandidate = new ManualResetEventSlim();
         var calls = 0;
         var editor = CreateEditor(path =>
@@ -78,7 +79,7 @@ public class DevPluginLocationEditorTests
             Interlocked.Increment(ref calls);
             if (path == CandidatePath)
             {
-                candidateEntered.Set();
+                candidateEntered.TrySetResult();
                 Assert.True(releaseCandidate.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
             }
 
@@ -90,7 +91,7 @@ public class DevPluginLocationEditorTests
         {
             editor.SetInputPath(row, CandidatePath);
             editor.SubmitEdit(row);
-            Assert.True(candidateEntered.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
+            await candidateEntered.Task.WaitAsync(WorkerTimeout, TestContext.Current.CancellationToken);
             Assert.True(editor.HasPendingEdits);
         }
         finally
@@ -98,14 +99,14 @@ public class DevPluginLocationEditorTests
             releaseCandidate.Set();
         }
 
-        PollUntil(editor, () => !editor.HasPendingEdits, refresh: false);
+        await PollUntilAsync(editor, () => !editor.HasPendingEdits, refresh: false);
 
         Assert.Equal(CandidatePath, row.Path);
         Assert.Equal(CandidatePath, editor.GetInputPath(row));
         Assert.Null(editor.GetPendingPath(row));
         Assert.Null(editor.GetRejectedEdit(row));
         Assert.True(editor.Changed);
-        Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref calls) == 2, WorkerTimeout));
+        await WaitUntilAsync(() => Volatile.Read(ref calls) == 2);
         var callsAfterCommit = Volatile.Read(ref calls);
         for (var i = 0; i < 100; i++)
             Assert.False(editor.HasPendingEdits);
@@ -116,14 +117,15 @@ public class DevPluginLocationEditorTests
     }
 
     [Fact]
-    public void QueuedEditResolvesWhileHiddenWithoutStartingUnrelatedWarnings()
+    public async Task QueuedEditResolvesWhileHiddenWithoutStartingUnrelatedWarnings()
     {
         const string unrelatedPath = @"C:\plugins\unrelated.dll";
-        using var acceptedEntered = new CountdownEvent(2);
+        var acceptedEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var acceptedCalls = 0;
         using var releaseAccepted = new ManualResetEventSlim();
-        using var candidateEntered = new ManualResetEventSlim();
+        var candidateEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var releaseCandidate = new ManualResetEventSlim();
-        using var unrelatedEntered = new ManualResetEventSlim();
+        var unrelatedEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var clock = new ManualClock();
         var calls = 0;
         var cache = new DevPluginPathValidationCache(path =>
@@ -131,16 +133,17 @@ public class DevPluginLocationEditorTests
             Interlocked.Increment(ref calls);
             if (path == CandidatePath)
             {
-                candidateEntered.Set();
+                candidateEntered.TrySetResult();
                 Assert.True(releaseCandidate.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
             }
             else if (path == unrelatedPath)
             {
-                unrelatedEntered.Set();
+                unrelatedEntered.TrySetResult();
             }
             else
             {
-                acceptedEntered.Signal();
+                if (Interlocked.Increment(ref acceptedCalls) == 2)
+                    acceptedEntered.TrySetResult();
                 Assert.True(releaseAccepted.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
             }
 
@@ -153,19 +156,19 @@ public class DevPluginLocationEditorTests
         try
         {
             editor.Refresh();
-            Assert.True(acceptedEntered.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
+            await acceptedEntered.Task.WaitAsync(WorkerTimeout, TestContext.Current.CancellationToken);
             editor.SetInputPath(row, CandidatePath);
             editor.SubmitEdit(row);
-            Assert.False(candidateEntered.IsSet);
+            Assert.False(candidateEntered.Task.IsCompleted);
             Assert.True(editor.HasPendingEdits);
 
             releaseAccepted.Set();
-            Assert.True(SpinWait.SpinUntil(() =>
+            await WaitUntilAsync(() =>
             {
                 cache.ConsumeCompleted();
                 return cache.GetStatus(OriginalPath) == DevPluginPathStatus.Valid &&
                        cache.GetStatus(OtherPath) == DevPluginPathStatus.Valid;
-            }, WorkerTimeout));
+            });
 
             for (var i = 0; i < 100; i++)
             {
@@ -173,16 +176,16 @@ public class DevPluginLocationEditorTests
                 Assert.True(editor.HasPendingEdits);
             }
 
-            Assert.False(candidateEntered.IsSet);
-            Assert.False(unrelatedEntered.IsSet);
+            Assert.False(candidateEntered.Task.IsCompleted);
+            Assert.False(unrelatedEntered.Task.IsCompleted);
             Assert.Equal(2, Volatile.Read(ref calls));
             Assert.Equal(OriginalPath, row.Path);
 
             // The Settings window advances already submitted edits even when this widget is hidden.
             editor.AdvancePendingEdits();
-            Assert.True(candidateEntered.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
+            await candidateEntered.Task.WaitAsync(WorkerTimeout, TestContext.Current.CancellationToken);
             Assert.True(editor.HasPendingEdits);
-            Assert.False(unrelatedEntered.IsSet);
+            Assert.False(unrelatedEntered.Task.IsCompleted);
         }
         finally
         {
@@ -190,7 +193,7 @@ public class DevPluginLocationEditorTests
             releaseCandidate.Set();
         }
 
-        PollUntil(editor, () => !editor.HasPendingEdits, refresh: false);
+        await PollUntilAsync(editor, () => !editor.HasPendingEdits, refresh: false);
         Assert.Equal(CandidatePath, row.Path);
         clock.Advance(TimeSpan.FromSeconds(2));
         for (var i = 0; i < 100; i++)
@@ -200,14 +203,14 @@ public class DevPluginLocationEditorTests
         }
 
         Assert.Equal(3, Volatile.Read(ref calls));
-        Assert.False(unrelatedEntered.IsSet);
+        Assert.False(unrelatedEntered.Task.IsCompleted);
         Assert.Equal(DevPluginLocationError.Pending, editor.GetWarning(editor.Locations[2]));
     }
 
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void FailedEditRestoresTheAcceptedPathAndShowsItsRejection(bool manifestUnavailable)
+    public async Task FailedEditRestoresTheAcceptedPathAndShowsItsRejection(bool manifestUnavailable)
     {
         var status = manifestUnavailable ? DevPluginPathStatus.ManifestUnavailable : DevPluginPathStatus.DllUnavailable;
         var expectedError = manifestUnavailable ? DevPluginLocationError.ManifestUnavailable : DevPluginLocationError.DllUnavailable;
@@ -216,7 +219,7 @@ public class DevPluginLocationEditorTests
 
         editor.SetInputPath(row, CandidatePath);
         editor.SubmitEdit(row);
-        PollUntil(editor, () => !editor.HasPendingEdits);
+        await PollUntilAsync(editor, () => !editor.HasPendingEdits);
 
         Assert.Equal(OriginalPath, row.Path);
         Assert.Equal(OriginalPath, editor.GetInputPath(row));
@@ -229,15 +232,15 @@ public class DevPluginLocationEditorTests
     }
 
     [Fact]
-    public void TypingANewerDraftRevokesTheSubmittedCandidatesAuthority()
+    public async Task TypingANewerDraftRevokesTheSubmittedCandidatesAuthority()
     {
-        using var candidateEntered = new ManualResetEventSlim();
+        var candidateEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var releaseCandidate = new ManualResetEventSlim();
         var editor = CreateEditor(path =>
         {
             if (path == CandidatePath)
             {
-                candidateEntered.Set();
+                candidateEntered.TrySetResult();
                 Assert.True(releaseCandidate.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
             }
 
@@ -249,7 +252,7 @@ public class DevPluginLocationEditorTests
         {
             editor.SetInputPath(row, CandidatePath);
             editor.SubmitEdit(row);
-            Assert.True(candidateEntered.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
+            await candidateEntered.Task.WaitAsync(WorkerTimeout, TestContext.Current.CancellationToken);
             editor.SetInputPath(row, OtherPath);
             Assert.False(editor.HasPendingEdits);
             Assert.Null(editor.GetPendingPath(row));
@@ -265,20 +268,20 @@ public class DevPluginLocationEditorTests
         Assert.False(editor.Changed);
 
         editor.SubmitEdit(row);
-        PollUntil(editor, () => !editor.HasPendingEdits);
+        await PollUntilAsync(editor, () => !editor.HasPendingEdits);
         Assert.Equal(OtherPath, row.Path);
     }
 
     [Fact]
-    public void ResumingInputCancelsAPendingEditBeforeTheNewBufferIsSubmitted()
+    public async Task ResumingInputCancelsAPendingEditBeforeTheNewBufferIsSubmitted()
     {
-        using var candidateEntered = new ManualResetEventSlim();
+        var candidateEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var releaseCandidate = new ManualResetEventSlim();
         var editor = CreateEditor(path =>
         {
             if (path == CandidatePath)
             {
-                candidateEntered.Set();
+                candidateEntered.TrySetResult();
                 Assert.True(releaseCandidate.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
             }
 
@@ -290,7 +293,7 @@ public class DevPluginLocationEditorTests
         {
             editor.SetInputPath(row, CandidatePath);
             editor.SubmitEdit(row);
-            Assert.True(candidateEntered.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
+            await candidateEntered.Task.WaitAsync(WorkerTimeout, TestContext.Current.CancellationToken);
 
             editor.CancelPendingEdit(row);
             Assert.False(editor.HasPendingEdits);
@@ -333,18 +336,18 @@ public class DevPluginLocationEditorTests
     }
 
     [Fact]
-    public void DiscardingAPendingEditRestoresTheAcceptedInputAndPreventsALateCommit()
+    public async Task DiscardingAPendingEditRestoresTheAcceptedInputAndPreventsALateCommit()
     {
-        using var candidateEntered = new ManualResetEventSlim();
+        var candidateEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var releaseCandidate = new ManualResetEventSlim();
-        using var candidateReturned = new ManualResetEventSlim();
+        var candidateReturned = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var editor = CreateEditor(path =>
         {
             if (path == CandidatePath)
             {
-                candidateEntered.Set();
+                candidateEntered.TrySetResult();
                 Assert.True(releaseCandidate.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
-                candidateReturned.Set();
+                candidateReturned.TrySetResult();
             }
 
             return DevPluginPathStatus.Valid;
@@ -355,7 +358,7 @@ public class DevPluginLocationEditorTests
         {
             editor.SetInputPath(row, CandidatePath);
             editor.SubmitEdit(row);
-            Assert.True(candidateEntered.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
+            await candidateEntered.Task.WaitAsync(WorkerTimeout, TestContext.Current.CancellationToken);
             Assert.True(editor.HasPendingEdits);
 
             editor.DiscardEdit(row);
@@ -369,7 +372,7 @@ public class DevPluginLocationEditorTests
             releaseCandidate.Set();
         }
 
-        Assert.True(candidateReturned.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
+        await candidateReturned.Task.WaitAsync(WorkerTimeout, TestContext.Current.CancellationToken);
         for (var i = 0; i < 100; i++)
         {
             editor.AdvancePendingEdits();
@@ -383,7 +386,7 @@ public class DevPluginLocationEditorTests
     }
 
     [Fact]
-    public void CompletedEditsStillResolveWhenValidityIsPolledAfterTheObservationBecomesStale()
+    public async Task CompletedEditsStillResolveWhenValidityIsPolledAfterTheObservationBecomesStale()
     {
         var clock = new ManualClock();
         var calls = 0;
@@ -399,12 +402,12 @@ public class DevPluginLocationEditorTests
         editor.SubmitEdit(row);
 
         // Delay the editor's commit until the cached observation has expired.
-        Assert.True(SpinWait.SpinUntil(() =>
+        await WaitUntilAsync(() =>
         {
             cache.ConsumeCompleted();
             return cache.GetStatus(CandidatePath) == DevPluginPathStatus.Valid &&
                    cache.GetStatus(OriginalPath) == DevPluginPathStatus.Valid;
-        }, WorkerTimeout));
+        });
         Assert.Equal(OriginalPath, row.Path);
         clock.Advance(TimeSpan.FromSeconds(2));
         var callsBeforeValidity = Volatile.Read(ref calls);
@@ -417,15 +420,15 @@ public class DevPluginLocationEditorTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void RemovingOrResettingARowDiscardsItsPendingEdit(bool reset)
+    public async Task RemovingOrResettingARowDiscardsItsPendingEdit(bool reset)
     {
-        using var candidateEntered = new ManualResetEventSlim();
+        var candidateEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var releaseCandidate = new ManualResetEventSlim();
         var editor = CreateEditor(path =>
         {
             if (path == CandidatePath)
             {
-                candidateEntered.Set();
+                candidateEntered.TrySetResult();
                 Assert.True(releaseCandidate.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
             }
 
@@ -437,7 +440,7 @@ public class DevPluginLocationEditorTests
         {
             editor.SetInputPath(oldRow, CandidatePath);
             editor.SubmitEdit(oldRow);
-            Assert.True(candidateEntered.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
+            await candidateEntered.Task.WaitAsync(WorkerTimeout, TestContext.Current.CancellationToken);
             if (reset)
                 editor.Reset([Location(OriginalPath)]);
             else
@@ -465,10 +468,10 @@ public class DevPluginLocationEditorTests
     }
 
     [Fact]
-    public void ResetAndResubmitOfTheSamePathRequiresANewObservation()
+    public async Task ResetAndResubmitOfTheSamePathRequiresANewObservation()
     {
-        using var firstEntered = new ManualResetEventSlim();
-        using var secondEntered = new ManualResetEventSlim();
+        var firstEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var releaseFirst = new ManualResetEventSlim();
         using var releaseSecond = new ManualResetEventSlim();
         var candidateCalls = 0;
@@ -479,12 +482,12 @@ public class DevPluginLocationEditorTests
 
             if (Interlocked.Increment(ref candidateCalls) == 1)
             {
-                firstEntered.Set();
+                firstEntered.TrySetResult();
                 Assert.True(releaseFirst.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
                 return DevPluginPathStatus.Valid;
             }
 
-            secondEntered.Set();
+            secondEntered.TrySetResult();
             Assert.True(releaseSecond.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
             return DevPluginPathStatus.ManifestUnavailable;
         });
@@ -494,18 +497,18 @@ public class DevPluginLocationEditorTests
             var oldRow = editor.Locations[0];
             editor.SetInputPath(oldRow, CandidatePath);
             editor.SubmitEdit(oldRow);
-            Assert.True(firstEntered.Wait(WorkerTimeout, TestContext.Current.CancellationToken));
+            await firstEntered.Task.WaitAsync(WorkerTimeout, TestContext.Current.CancellationToken);
 
             editor.Reset([Location(OriginalPath)]);
             var newRow = editor.Locations[0];
             editor.SetInputPath(newRow, CandidatePath);
             editor.SubmitEdit(newRow);
             releaseFirst.Set();
-            Assert.True(SpinWait.SpinUntil(() =>
+            await WaitUntilAsync(() =>
             {
                 editor.Refresh();
-                return secondEntered.IsSet;
-            }, WorkerTimeout));
+                return secondEntered.Task.IsCompleted;
+            });
             Assert.True(editor.HasPendingEdits);
             Assert.Equal(OriginalPath, newRow.Path);
         }
@@ -515,21 +518,21 @@ public class DevPluginLocationEditorTests
             releaseSecond.Set();
         }
 
-        PollUntil(editor, () => !editor.HasPendingEdits);
+        await PollUntilAsync(editor, () => !editor.HasPendingEdits);
         Assert.Equal(OriginalPath, editor.Locations[0].Path);
         Assert.Equal(DevPluginLocationError.ManifestUnavailable, editor.GetRejectedEdit(editor.Locations[0])?.Error);
         Assert.Equal(2, Volatile.Read(ref candidateCalls));
     }
 
     [Fact]
-    public void EditCannotCommitAPathAlreadyUsedByAnotherRow()
+    public async Task EditCannotCommitAPathAlreadyUsedByAnotherRow()
     {
         var editor = CreateEditor(_ => DevPluginPathStatus.Valid, Location(OriginalPath), Location(CandidatePath));
         var row = editor.Locations[0];
 
         editor.SetInputPath(row, CandidatePath);
         editor.SubmitEdit(row);
-        PollUntil(editor, () => !editor.HasPendingEdits);
+        await PollUntilAsync(editor, () => !editor.HasPendingEdits);
 
         Assert.Equal(OriginalPath, row.Path);
         Assert.Equal(DevPluginLocationError.Duplicate, editor.GetRejectedEdit(row)?.Error);
@@ -537,7 +540,7 @@ public class DevPluginLocationEditorTests
     }
 
     [Fact]
-    public void DuplicateWarningsUseTheLiveListInsteadOfCachedErrors()
+    public async Task DuplicateWarningsUseTheLiveListInsteadOfCachedErrors()
     {
         var calls = 0;
         var editor = CreateEditor(_ =>
@@ -547,7 +550,7 @@ public class DevPluginLocationEditorTests
         }, Location(OriginalPath), Location(OriginalPath));
         var row = editor.Locations[0];
         editor.Refresh();
-        PollUntil(editor, () => editor.GetWarning(row) != DevPluginLocationError.Pending);
+        await PollUntilAsync(editor, () => editor.GetWarning(row) != DevPluginLocationError.Pending);
         Assert.Equal(DevPluginLocationError.Duplicate, editor.GetWarning(row));
 
         editor.Remove(editor.Locations[1]);
@@ -556,7 +559,7 @@ public class DevPluginLocationEditorTests
     }
 
     [Fact]
-    public void EditingPreservesOrdinalDuplicateComparison()
+    public async Task EditingPreservesOrdinalDuplicateComparison()
     {
         var editor = CreateEditor(_ => DevPluginPathStatus.Valid, Location(OriginalPath), Location(CandidatePath));
         var row = editor.Locations[0];
@@ -564,7 +567,7 @@ public class DevPluginLocationEditorTests
 
         editor.SetInputPath(row, differentlyCasedPath);
         editor.SubmitEdit(row);
-        PollUntil(editor, () => !editor.HasPendingEdits);
+        await PollUntilAsync(editor, () => !editor.HasPendingEdits);
 
         Assert.Equal(differentlyCasedPath, row.Path);
         Assert.Null(editor.GetRejectedEdit(row));
@@ -592,7 +595,7 @@ public class DevPluginLocationEditorTests
     }
 
     [Fact]
-    public void ResetClonesConfigurationAndDoesNotProbeUntilRefreshEvenForDisabledLocations()
+    public async Task ResetClonesConfigurationAndDoesNotProbeUntilRefreshEvenForDisabledLocations()
     {
         var calls = 0;
         var source = Location(OriginalPath);
@@ -609,7 +612,7 @@ public class DevPluginLocationEditorTests
         Assert.Equal(DevPluginLocationError.Pending, editor.GetWarning(editor.Locations[0]));
 
         editor.Refresh();
-        PollUntil(editor, () => editor.GetWarning(editor.Locations[0]) != DevPluginLocationError.Pending);
+        await PollUntilAsync(editor, () => editor.GetWarning(editor.Locations[0]) != DevPluginLocationError.Pending);
         Assert.Equal(DevPluginLocationError.DllUnavailable, editor.GetWarning(editor.Locations[0]));
         Assert.Equal(1, Volatile.Read(ref calls));
     }
@@ -625,16 +628,26 @@ public class DevPluginLocationEditorTests
 
     private static DevPluginLocationSettings Location(string path) => new() { Path = path, IsEnabled = true };
 
-    private static void PollUntil(DevPluginLocationEditor editor, Func<bool> condition, bool refresh = true)
+    private static Task PollUntilAsync(DevPluginLocationEditor editor, Func<bool> condition, bool refresh = true)
     {
-        Assert.True(SpinWait.SpinUntil(() =>
+        return WaitUntilAsync(() =>
         {
             if (refresh)
                 editor.Refresh();
             else
                 editor.ConsumeCompleted();
             return condition();
-        }, WorkerTimeout), "The submitted validation did not finish.");
+        });
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var started = Stopwatch.GetTimestamp();
+        while (!condition())
+        {
+            Assert.True(Stopwatch.GetElapsedTime(started) < WorkerTimeout, "The submitted validation did not finish.");
+            await Task.Delay(1, TestContext.Current.CancellationToken);
+        }
     }
 
     private sealed class ManualClock : TimeProvider

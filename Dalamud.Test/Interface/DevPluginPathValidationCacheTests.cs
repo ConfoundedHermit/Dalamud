@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 
 using Dalamud.Interface.Internal.Windows.Settings.Widgets;
 
@@ -15,7 +16,7 @@ public class DevPluginPathValidationCacheTests
     private static readonly TimeSpan WorkerTimeout = TimeSpan.FromSeconds(5);
 
     [Fact]
-    public void PollingDoesNotWaitForBlockedProbesAndDoesNotRunThemOnTheCaller()
+    public Task PollingDoesNotWaitForBlockedProbesAndDoesNotRunThemOnTheCaller() => RunOnUiThread(() =>
     {
         using var entered = new ManualResetEventSlim();
         using var release = new ManualResetEventSlim();
@@ -52,10 +53,10 @@ public class DevPluginPathValidationCacheTests
         }
 
         AwaitStatus(cache, "plugin", DevPluginPathStatus.Valid);
-    }
+    });
 
     [Fact]
-    public void ResetRetainsPhysicalSlotsAndRejectsResultsForRecreatedEntries()
+    public Task ResetRetainsPhysicalSlotsAndRejectsResultsForRecreatedEntries() => RunOnUiThread(() =>
     {
         using var bothEntered = new CountdownEvent(2);
         using var releaseOriginal = new ManualResetEventSlim();
@@ -124,10 +125,10 @@ public class DevPluginPathValidationCacheTests
         Assert.InRange(maximumActive, 1, 2);
         Assert.Equal(1, maximumActiveForPath);
         Assert.False(counts.ContainsKey("obsolete"));
-    }
+    });
 
     [Fact]
-    public void RemovingAndReaddingAPathDoesNotPublishItsOldObservation()
+    public Task RemovingAndReaddingAPathDoesNotPublishItsOldObservation() => RunOnUiThread(() =>
     {
         using var firstEntered = new ManualResetEventSlim();
         using var releaseFirst = new ManualResetEventSlim();
@@ -172,10 +173,10 @@ public class DevPluginPathValidationCacheTests
 
         AwaitStatus(cache, "a", DevPluginPathStatus.Valid);
         Assert.Equal(2, calls);
-    }
+    });
 
     [Fact]
-    public void InvalidationRequiresANewProbeAndDiscardsTheOldInFlightResult()
+    public Task InvalidationRequiresANewProbeAndDiscardsTheOldInFlightResult() => RunOnUiThread(() =>
     {
         using var firstEntered = new ManualResetEventSlim();
         using var releaseFirst = new ManualResetEventSlim();
@@ -221,10 +222,10 @@ public class DevPluginPathValidationCacheTests
         cache.Invalidate("a");
         Assert.Equal(DevPluginPathStatus.Pending, cache.GetStatus("a"));
         Assert.Equal(2, calls);
-    }
+    });
 
     [Fact]
-    public void QueuedPathsKeepTheirTurnAheadOfRefreshingAnEarlierPath()
+    public Task QueuedPathsKeepTheirTurnAheadOfRefreshingAnEarlierPath() => RunOnUiThread(() =>
     {
         using var firstEntered = new ManualResetEventSlim();
         using var secondEntered = new ManualResetEventSlim();
@@ -271,10 +272,10 @@ public class DevPluginPathValidationCacheTests
 
         AwaitStatus(cache, "b", DevPluginPathStatus.Valid);
         AwaitStatus(cache, "c", DevPluginPathStatus.Valid);
-    }
+    });
 
     [Fact]
-    public void NegativeResultsRefreshAfterOneSecondAndKeepTheirPreviousStatus()
+    public Task NegativeResultsRefreshAfterOneSecondAndKeepTheirPreviousStatus() => RunOnUiThread(() =>
     {
         using var secondEntered = new ManualResetEventSlim();
         using var releaseSecond = new ManualResetEventSlim();
@@ -312,10 +313,10 @@ public class DevPluginPathValidationCacheTests
         }
 
         AwaitStatus(cache, "a", DevPluginPathStatus.Valid);
-    }
+    });
 
     [Fact]
-    public void RefreshAgeStartsAtWorkerCompletionInsteadOfResultConsumption()
+    public Task RefreshAgeStartsAtWorkerCompletionInsteadOfResultConsumption() => RunOnUiThread(() =>
     {
         using var timestampRead = new ManualResetEventSlim();
         var clock = new ManualClock();
@@ -333,10 +334,10 @@ public class DevPluginPathValidationCacheTests
         clock.Advance(TimeSpan.FromSeconds(1));
         AwaitStatus(cache, "a", DevPluginPathStatus.Valid);
         Assert.Equal(DevPluginPathStatus.Pending, cache.GetFreshStatus("a"));
-    }
+    });
 
     [Fact]
-    public void LoadingAndConsumingDoNotStartQueuedWork()
+    public Task LoadingAndConsumingDoNotStartQueuedWork() => RunOnUiThread(() =>
     {
         var calls = 0;
         var cache = new DevPluginPathValidationCache(_ =>
@@ -357,10 +358,10 @@ public class DevPluginPathValidationCacheTests
         Assert.Equal(DevPluginPathStatus.Pending, cache.GetStatus("c"));
         cache.Refresh();
         AwaitStatus(cache, "c", DevPluginPathStatus.Valid);
-    }
+    });
 
     [Fact]
-    public void HiddenPendingPumpStartsOnlySubmittedCandidatesAndNeverRefreshesFinishedResults()
+    public Task HiddenPendingPumpStartsOnlySubmittedCandidatesAndNeverRefreshesFinishedResults() => RunOnUiThread(() =>
     {
         using var warningsEntered = new CountdownEvent(2);
         using var releaseWarnings = new ManualResetEventSlim();
@@ -423,10 +424,10 @@ public class DevPluginPathValidationCacheTests
             cache.ConsumeCompleted();
             return cache.GetStatus("unrelated") == DevPluginPathStatus.Valid;
         }, WorkerTimeout));
-    }
+    });
 
     [Fact]
-    public void ProbeFailuresBecomeUnavailableObservationsAndReleaseTheirSlots()
+    public Task ProbeFailuresBecomeUnavailableObservationsAndReleaseTheirSlots() => RunOnUiThread(() =>
     {
         var cache = new DevPluginPathValidationCache(path => path == "bad" ? throw new IOException("Unavailable") : DevPluginPathStatus.Valid);
         cache.SetPaths(["bad", "good", "next"]);
@@ -435,10 +436,10 @@ public class DevPluginPathValidationCacheTests
         AwaitStatus(cache, "good", DevPluginPathStatus.Valid);
         cache.Refresh();
         AwaitStatus(cache, "next", DevPluginPathStatus.Valid);
-    }
+    });
 
     [Fact]
-    public void ExactPathsStayDistinctWithoutNormalization()
+    public Task ExactPathsStayDistinctWithoutNormalization() => RunOnUiThread(() =>
     {
         var paths = new ConcurrentBag<string>();
         var cache = new DevPluginPathValidationCache(path =>
@@ -451,7 +452,7 @@ public class DevPluginPathValidationCacheTests
         AwaitStatus(cache, "a", DevPluginPathStatus.Valid);
         AwaitStatus(cache, "A", DevPluginPathStatus.Valid);
         Assert.Equal(new[] { "A", "a" }, paths.OrderBy(path => path, StringComparer.Ordinal));
-    }
+    });
 
     [Theory]
     [InlineData("", false)]
@@ -463,7 +464,7 @@ public class DevPluginPathValidationCacheTests
         => Assert.Equal(expected, DevPluginPathValidationCache.IsValidPath(path));
 
     [Fact]
-    public void DefaultProbeTracksDllAndManifestChangesAndPreservesErrorPrecedence()
+    public Task DefaultProbeTracksDllAndManifestChangesAndPreservesErrorPrecedence() => RunOnUiThread(() =>
     {
         var directory = Path.Combine(Path.GetTempPath(), $"dalamud-dev-path-{Guid.NewGuid():N}");
         Directory.CreateDirectory(directory);
@@ -505,7 +506,12 @@ public class DevPluginPathValidationCacheTests
             File.Delete(Path.Combine(directory, "plugin.txt"));
             Directory.Delete(directory);
         }
-    }
+    });
+
+    // Keep synchronous UI polling and worker gates off the shared pool that runs the probes.
+    // One dedicated driver thread also preserves the cache's UI-thread contract and thread-ID checks.
+    private static Task RunOnUiThread(Action action)
+        => Task.Factory.StartNew(action, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
     private static void AwaitStatus(DevPluginPathValidationCache cache, string path, DevPluginPathStatus expected)
         => Assert.True(SpinWait.SpinUntil(() =>

@@ -16,4 +16,11 @@
         <ProjectReference Include="..\Dalamud\Dalamud.csproj" />
     </ItemGroup>
 
+    <!-- Refresh native fixtures on every build so tests cannot silently use older DLLs. -->
+    <ItemGroup>
+        <None Include="..\bin\$(Configuration)\cimgui.dll" Link="cimgui.dll" CopyToOutputDirectory="Always" />
+        <None Include="..\bin\$(Configuration)\cimplot.dll" Link="cimplot.dll" CopyToOutputDirectory="Always" />
+        <None Include="..\bin\$(Configuration)\cimguizmo.dll" Link="cimguizmo.dll" CopyToOutputDirectory="Always" />
+    </ItemGroup>
+
 </Project>
