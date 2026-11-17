@@ -60,7 +60,9 @@ public class ReShadeAddonLifetimeTests
             GetCallbackAddress(registration, callbackField),
             Marshal.GetFunctionPointerForDelegate(after));
         var originalCallbacks = dispatcher.ReadCallbacks();
-        var worker = Task.Run(() =>
+        // The simulated native dispatcher blocks until released. Use a dedicated worker so ThreadPool
+        // contention cannot prevent it from reaching the paused callback before the timeout.
+        var worker = Task.Factory.StartNew(() =>
         {
             try
             {
@@ -73,7 +75,7 @@ public class ReShadeAddonLifetimeTests
                 GC.KeepAlive(before);
                 GC.KeepAlive(after);
             }
-        });
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         var joined = false;
         try
         {
