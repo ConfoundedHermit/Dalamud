@@ -1,6 +1,7 @@
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
-using System.Diagnostics.CodeAnalysis;
+using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -14,23 +15,54 @@ using static TerraFX.Interop.Windows.Windows;
 namespace Dalamud.Interface.ImGuiBackend.Helpers;
 
 /// <summary>
-/// Removes ReShade wrappers from COM interfaces used for rendering.
+/// Removes ReShade and GShade wrappers from COM interfaces used for rendering.
 /// </summary>
-[SuppressMessage(
-    "StyleCop.CSharp.LayoutRules",
-    "SA1519:Braces should not be omitted from multi-line child statement",
-    Justification = "Multiple fixed blocks")]
 internal static unsafe class ReShadePeeler
 {
     /// <summary>
-    /// Peels <see cref="IDXGISwapChain"/> if it is wrapped by ReShade.
+    /// Removes recognized ReShade and GShade wrappers from a swap-chain interface.
     /// </summary>
     /// <param name="comptr">[inout] The COM pointer to an instance of <see cref="IDXGISwapChain"/>.</param>
     /// <typeparam name="T">A COM type that is or extends <see cref="IDXGISwapChain"/>.</typeparam>
-    /// <returns><c>true</c> if peeled.</returns>
+    /// <returns><c>true</c> if at least one wrapper was removed.</returns>
     public static bool PeelSwapChain<T>(ComPtr<T>* comptr)
         where T : unmanaged, IDXGISwapChain.Interface =>
         PeelIUnknown(comptr, sizeof(IDXGISwapChain.Vtbl<IDXGISwapChain>));
+
+    /// <summary>Checks whether a function belongs to a ReShade or GShade graphics proxy.</summary>
+    /// <remarks>
+    /// Recognition uses graphics exports and a case-sensitive file description, independent of the DLL filename.
+    /// Unavailable module or version metadata is treated as a non-match.
+    /// </remarks>
+    /// <param name="ptr">A function address.</param>
+    /// <returns>Whether the required exports and version description match.</returns>
+    internal static bool BelongsInReShadeDll(nint ptr)
+    {
+        using var module = ModuleReference.FromAddress(ptr);
+        if (module is null ||
+            !module.HasExport("CreateDXGIFactory"u8) ||
+            !module.HasExport("D2D1CreateDevice"u8) ||
+            !module.HasExport("D3D10CreateDevice"u8) ||
+            !module.HasExport("D3D11CreateDevice"u8) ||
+            !module.HasExport("D3D12CreateDevice"u8) ||
+            !module.HasExport("glBegin"u8) ||
+            !module.HasExport("vkCreateDevice"u8))
+            return false;
+
+        try
+        {
+            var path = module.GetFileName();
+            if (path is null)
+                return false;
+
+            var description = FileVersionInfo.GetVersionInfo(path).FileDescription;
+            return description is not null && (description.Contains("GShade") || description.Contains("ReShade"));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception or ArgumentException)
+        {
+            return false;
+        }
+    }
 
     private static bool PeelIUnknown<T>(ComPtr<T>* comptr, nint vtblSize)
         where T : unmanaged, IUnknown.Interface
@@ -98,56 +130,6 @@ internal static unsafe class ReShadePeeler
         }
 
         return changed;
-    }
-
-    private static bool BelongsInReShadeDll(nint ptr)
-    {
-        foreach (ProcessModule processModule in CurrentProcessModules.ModuleCollection)
-        {
-            if (ptr < processModule.BaseAddress)
-                continue;
-
-            var dosh = (IMAGE_DOS_HEADER*)processModule.BaseAddress;
-            var nth = (IMAGE_NT_HEADERS64*)(processModule.BaseAddress + dosh->e_lfanew);
-            if (ptr >= processModule.BaseAddress + nth->OptionalHeader.SizeOfImage)
-                continue;
-
-            fixed (byte* pfn0 = "CreateDXGIFactory"u8)
-            fixed (byte* pfn1 = "D2D1CreateDevice"u8)
-            fixed (byte* pfn2 = "D3D10CreateDevice"u8)
-            fixed (byte* pfn3 = "D3D11CreateDevice"u8)
-            fixed (byte* pfn4 = "D3D12CreateDevice"u8)
-            fixed (byte* pfn5 = "glBegin"u8)
-            fixed (byte* pfn6 = "vkCreateDevice"u8)
-            {
-                if (GetProcAddress((HMODULE)dosh, (sbyte*)pfn0) == null)
-                    continue;
-                if (GetProcAddress((HMODULE)dosh, (sbyte*)pfn1) == null)
-                    continue;
-                if (GetProcAddress((HMODULE)dosh, (sbyte*)pfn2) == null)
-                    continue;
-                if (GetProcAddress((HMODULE)dosh, (sbyte*)pfn3) == null)
-                    continue;
-                if (GetProcAddress((HMODULE)dosh, (sbyte*)pfn4) == null)
-                    continue;
-                if (GetProcAddress((HMODULE)dosh, (sbyte*)pfn5) == null)
-                    continue;
-                if (GetProcAddress((HMODULE)dosh, (sbyte*)pfn6) == null)
-                    continue;
-            }
-
-            var fileInfo = FileVersionInfo.GetVersionInfo(processModule.FileName);
-
-            if (fileInfo.FileDescription == null)
-                continue;
-
-            if (!fileInfo.FileDescription.Contains("GShade") && !fileInfo.FileDescription.Contains("ReShade"))
-                continue;
-
-            return true;
-        }
-
-        return false;
     }
 
     private static bool IsReShadedComObject<T>(T* obj)

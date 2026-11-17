@@ -1,17 +1,26 @@
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 using Dalamud.Support;
-
-using TerraFX.Interop.Windows;
-
-using static TerraFX.Interop.Windows.Windows;
 
 namespace Dalamud.Interface.Internal.Unwrapper;
 
 /// <summary>Recognizes COM wrappers implemented by a module that exports the ReShade addon API.</summary>
 internal unsafe class ReShadeUnwrapper : ComHookUnwrapper
 {
+    /// <summary>Checks whether a function's module exports the ReShade addon API.</summary>
+    /// <remarks>Recognition does not require a particular filename or version metadata.</remarks>
+    /// <param name="ptr">A function address.</param>
+    /// <returns>Whether the owner exports all four addon entry points.</returns>
+    internal static bool BelongsInReShadeDll(nint ptr)
+    {
+        using var module = ModuleReference.FromAddress(ptr);
+        return module is not null &&
+               module.HasExport("ReShadeRegisterAddon"u8) &&
+               module.HasExport("ReShadeUnregisterAddon"u8) &&
+               module.HasExport("ReShadeRegisterEvent"u8) &&
+               module.HasExport("ReShadeUnregisterEvent"u8);
+    }
+
     /// <inheritdoc/>
     protected override bool IsRelevantComObject<T>(T* obj)
     {
@@ -38,30 +47,6 @@ internal unsafe class ReShadeUnwrapper : ComHookUnwrapper
         catch
         {
             return false;
-        }
-    }
-
-    private static bool BelongsInReShadeDll(nint ptr)
-    {
-        foreach (ProcessModule processModule in CurrentProcessModules.ModuleCollection)
-        {
-            if (ptr < processModule.BaseAddress ||
-                ptr >= processModule.BaseAddress + processModule.ModuleMemorySize ||
-                !HasProcExported(processModule, "ReShadeRegisterAddon"u8) ||
-                !HasProcExported(processModule, "ReShadeUnregisterAddon"u8) ||
-                !HasProcExported(processModule, "ReShadeRegisterEvent"u8) ||
-                !HasProcExported(processModule, "ReShadeUnregisterEvent"u8))
-                continue;
-
-            return true;
-        }
-
-        return false;
-
-        static bool HasProcExported(ProcessModule m, ReadOnlySpan<byte> name)
-        {
-            fixed (byte* p = name)
-                return GetProcAddress((HMODULE)m.BaseAddress, (sbyte*)p) != null;
         }
     }
 }
