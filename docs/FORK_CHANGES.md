@@ -2,6 +2,8 @@
 
 Changes to Dalamud Plus relative to upstream Dalamud.
 
+Last reviewed against `main` at **`e701ebc61370fc183e82178e01fa2e0f92ceaf65`** (`e701ebc61`) on 2026-11-17.
+
 ## Rendering and presentation
 
 [Dx11Win32Backend](../Dalamud/Interface/ImGuiBackend/Dx11Win32Backend.cs) and [InterfaceManager](../Dalamud/Interface/Internal/InterfaceManager.cs) separate UI construction from presentation in every presentation mode:
@@ -113,6 +115,17 @@ Managed callback identity uses method and receiver reference across delegate typ
 
 [AddonLifecycle](../Dalamud/Game/Addon/Lifecycle/AddonLifecycle.cs) restores the prior `isInvokingListeners` value in `finally` around complete dispatch. Empty dispatch no longer leaves later mutations deferred, and nested dispatch no longer clears the outer guard.
 
+## Developer plugin location settings
+
+[DevPluginsSettingsEntry](../Dalamud/Interface/Internal/Windows/Settings/Widgets/DevPluginsSettingsEntry.cs) replaces per-frame DLL/manifest filesystem checks with [DevPluginPathValidationCache](../Dalamud/Interface/Internal/Windows/Settings/Widgets/DevPluginPathValidationCache.cs) and keeps editing state in [DevPluginLocationEditor](../Dalamud/Interface/Internal/Windows/Settings/Widgets/DevPluginLocationEditor.cs):
+
+- DLL and sibling `.json` existence checks run on background workers, with at most two running probes per cache. Drawing, validity checks, and Save consume cached state without waiting for filesystem I/O.
+- Observations refresh after one second from worker completion while the widget is drawn; previous observations remain visible during refresh. Reset, removal, and resubmission reject late results. Running probes retain their slots until completion, including after invalidation.
+- Draft text stays separate from accepted paths. Enter submits a replacement for a fresh check; success requires filesystem validation and a duplicate check against the current accepted locations. Rejection restores the accepted input and retains feedback.
+- Editing again, cancelling, removing a row, or reloading settings prevents outstanding submissions from committing. Stable row identities and input revision IDs restore text retained by native ImGui after rejected or discarded edits.
+- [SettingsWindow](../Dalamud/Interface/Internal/Windows/Settings/SettingsWindow.cs) advances pending submissions even when tabs, search, or disabled developer mode hide the field. Save remains blocked until submitted replacements resolve or are cancelled; ordinary filesystem warnings do not block it.
+- Adding a location still checks only syntax and duplicates, allowing paths whose DLL/manifest do not exist yet. Paths require a rooted path and exact lowercase `.dll` extension. Additions retain case-insensitive duplicate checks; edits and warnings use ordinal comparison without normalization.
+
 ## Module-cache refactor
 
 [CurrentProcessModules](../Dalamud/Support/CurrentProcessModules.cs) replaces its explicit static backing field with property backing storage and clarifies the cache/invalidation documentation.
@@ -141,6 +154,8 @@ Managed callback identity uses method and receiver reference across delegate typ
 ### Build CI
 
 [Build CI](../.github/workflows/main.yml) uses explicit read-only repository permissions and removes upstream certificate signing, attestation, and distribution-repository deployment. The PR API-compatibility job moves from .NET 7 to .NET 10.0.100. Checkout steps across workflows are pinned to checkout v4.3.1 by SHA.
+
+Debug and Release jobs record the selected .NET environment and run VSTest crash-blame diagnostics with mini dumps, normal console logging, and TRX results under `TestResults`. ProcDump setup is best-effort, with standard blame diagnostics retained if setup fails. Failed jobs upload per-configuration results and matching `cimgui`, `cimplot`, and `cimguizmo` DLLs/PDBs as diagnostic artifacts retained for seven days.
 
 ### Release tags and packaging
 
@@ -171,3 +186,7 @@ Upstream sync, dependency updates, and backups run on six-hour schedules, with m
 New fixtures cover snapshot allocation/resize, backend construction/admission, draw-list and texture dispatch synchronization, secondary-viewport presentation, native-presentation lock handoff, callback draining, asynchronous shutdown, ReShade registration lifetime, NvPresent forwarding decoding, duplicate hooks, and addon dispatch. A shared presentation fixture supplies controlled swap-chain/backend behavior.
 
 The blocking simulated ReShade dispatcher uses a dedicated long-running task instead of `Task.Run`, preventing ThreadPool contention from delaying its paused callback.
+
+New `DevPluginPathValidationCacheTests`, `DevPluginLocationEditorTests`, and `DevPluginPathInputTests` cover bounded/background checks, stale observations, invalidation and queue order, submitted-edit acceptance/rejection, cancellation and duplicates, hidden fields, and native ImGui input restoration.
+
+Cache test coordination uses dedicated driver threads, and editor/shutdown coordinators await progress signals so shared ThreadPool probes and unload work can run on constrained runners. [Dalamud.Test.csproj](../Dalamud.Test/Dalamud.Test.csproj) always refreshes the three native ImGui binding DLLs from the current configuration's build outputs. Commit `07df6f342` records 355 passing tests in Release and Debug, with Debug limited to two logical processors; the earlier hosted Release access violation remains unresolved in that record.
