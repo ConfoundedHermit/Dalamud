@@ -1,5 +1,7 @@
 using System;
+using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Numerics;
 using System.Reflection;
 using System.Reflection.Emit;
@@ -17,6 +19,7 @@ using Dalamud.Interface.ImGuiBackend.Renderers;
 using Dalamud.Interface.Internal;
 using Dalamud.IoC.Internal;
 using Dalamud.Utility;
+using Dalamud.Utility.Timing;
 
 using TerraFX.Interop.DirectX;
 using TerraFX.Interop.Windows;
@@ -52,10 +55,20 @@ public class SecondaryViewportPresentationTests
                 stage = "installing secondary Present proxy";
                 Assert.Equal(2, ImGui.GetPlatformIO().Viewports.Size);
                 using var presentation = new SynchronousPresent(ImGui.GetPlatformIO().Viewports[1]);
+                var recorder = new FrameTimingRecorder(capacity: 128);
+                Assert.True(recorder.SetEnabled(true));
+                // Replay the snapshot built before collection to exercise missing timing metadata.
+                Replay(fixture.Backend, recorder);
 
                 using var pipelineState = fixture.BindPipelineState();
                 stage = "controlled Step";
-                fixture.Backend.Step();
+                var step = recorder.Begin(FrameTimingSource.KernelPresent, FrameTimingSpan.KernelPresent, out _);
+                using (var stepScope = new FrameTimingSpanScope(step))
+                {
+                    fixture.Backend.Step(step);
+                    stepScope.End();
+                }
+
                 presentation.Failure?.Throw();
                 Assert.Equal(1, presentation.PresentCalls);
                 Assert.Equal(1, presentation.MessageCalls);
@@ -75,8 +88,8 @@ public class SecondaryViewportPresentationTests
                         try
                         {
                             workerEntered.Set();
-                            fixture.Backend.Render();
-                            fixture.Backend.Render();
+                            Replay(fixture.Backend, recorder);
+                            Replay(fixture.Backend, recorder);
                         }
                         finally
                         {
@@ -110,6 +123,46 @@ public class SecondaryViewportPresentationTests
                 Assert.Equal(1, presentation.PresentCalls);
                 Assert.Equal(1, presentation.MessageCalls);
                 pipelineState.AssertRestored();
+
+                var summary = recorder.ReadSummary();
+                Assert.NotNull(summary);
+                var records = summary.Records;
+                var secondary = Assert.Single(records, record => record.Span == FrameTimingSpan.SecondaryWork);
+                var draw = Assert.Single(records, record => record.Span == FrameTimingSpan.SecondaryDraw);
+                var present = Assert.Single(records, record => record.Span == FrameTimingSpan.SecondaryPresent);
+                Assert.Equal(FrameTimingOutcome.Completed, present.Outcome);
+                Assert.Equal(0, present.NativeStatus);
+                Assert.Equal(presentation.PresentThread, present.ThreadId);
+                Assert.True(secondary.StartTick <= draw.StartTick && draw.EndTick <= present.StartTick);
+                Assert.True(present.EndTick <= secondary.EndTick);
+                Assert.True(present.StartTick <= presentation.StartTick && presentation.EndTick <= present.EndTick);
+
+                var publication = Assert.Single(records, record => record.Kind == FrameTimingRecordKind.Publication);
+                var finalized = Assert.Single(records, record => record.Span == FrameTimingSpan.UiFinalize);
+                Assert.NotNull(publication.SnapshotId);
+                var replays = records.Where(record => record.Span == FrameTimingSpan.MainReplay).ToArray();
+                Assert.Equal(3, replays.Length);
+                Assert.Null(replays[0].SnapshotId);
+                Assert.Null(replays[0].SnapshotAgeTicks);
+                Assert.All(replays.Skip(1), replay =>
+                {
+                    Assert.Equal(FrameTimingOutcome.Completed, replay.Outcome);
+                    Assert.Equal(worker.ManagedThreadId, replay.ThreadId);
+                    Assert.Equal(publication.SnapshotId, replay.SnapshotId);
+                    Assert.Equal(replay.StartTick - finalized.EndTick, replay.SnapshotAgeTicks);
+                });
+
+                // Replay the same snapshot to check that metadata is scoped to its publication session.
+                Assert.True(recorder.SetEnabled(false));
+                Assert.True(recorder.SetEnabled(true));
+                Replay(fixture.Backend, recorder);
+                var newSession = recorder.ReadSummary();
+                Assert.NotNull(newSession);
+                Assert.NotEqual(summary.SessionId, newSession.SessionId);
+                var stale = Assert.Single(newSession.Records, record => record.Span == FrameTimingSpan.MainReplay);
+                Assert.Equal(FrameTimingOutcome.Completed, stale.Outcome);
+                Assert.Null(stale.SnapshotId);
+                Assert.Null(stale.SnapshotAgeTicks);
             }
         });
     }
@@ -138,6 +191,13 @@ public class SecondaryViewportPresentationTests
         worker.Start();
         Assert.True(worker.Join(Limit));
         failure?.Throw();
+    }
+
+    private static void Replay(Dx11Win32Backend backend, FrameTimingRecorder recorder)
+    {
+        var callback = recorder.Begin(FrameTimingSource.DxgiPresent, FrameTimingSpan.OverlayCallback, out _);
+        using var scope = new FrameTimingSpanScope(callback);
+        scope.End(backend.Render(callback));
     }
 
     private static void RunOnOwner(Action action)
@@ -509,15 +569,21 @@ public class SecondaryViewportPresentationTests
             Marshal.WriteIntPtr(this.swapChain, this.vtable);
             this.present = (_, _, _) =>
             {
+                this.StartTick = Stopwatch.GetTimestamp();
                 try
                 {
                     this.PresentCalls++;
                     this.PresentThread = Environment.CurrentManagedThreadId;
+                    Thread.Sleep(15);
                     this.SendSucceeded = SendMessageTimeoutW(this.window, TestMessage, 0, 0, 3, 1000, out _) != 0;
                 }
                 catch (Exception exception)
                 {
                     this.Failure = ExceptionDispatchInfo.Capture(exception);
+                }
+                finally
+                {
+                    this.EndTick = Stopwatch.GetTimestamp();
                 }
 
                 return 0;
@@ -539,6 +605,10 @@ public class SecondaryViewportPresentationTests
         public int PresentThread { get; private set; }
 
         public bool SendSucceeded { get; private set; }
+
+        public long StartTick { get; private set; }
+
+        public long EndTick { get; private set; }
 
         public ExceptionDispatchInfo? Failure { get; private set; }
 

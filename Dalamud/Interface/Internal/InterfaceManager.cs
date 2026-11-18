@@ -571,11 +571,15 @@ internal partial class InterfaceManager : IInternalAsyncDisposableService
     }
 
     private static void CallOriginalKernelDeviceSwapChainPresent(PresentDelegate original, nint thisPtr)
+        => CallTimedOriginalKernelDeviceSwapChainPresent(original, thisPtr, default);
+
+    private static void CallTimedOriginalKernelDeviceSwapChainPresent(PresentDelegate original, nint thisPtr, FrameTimingProbe timing)
     {
-        // Release native-update ownership while Present may wait for NvPresent worker renders.
-        // Restore every recursion level before the native update resumes.
-        using var presentation = ThreadSafety.EnterNativePresentation();
+        // Release the framework guard so NvPresent workers can render while native Present waits.
+        using var presentation = ThreadSafety.EnterNativePresentation(timing);
+        using var continuation = new FrameTimingSpanScope(timing.Begin(FrameTimingSpan.KernelNativePresent));
         original(thisPtr);
+        continuation.End();
     }
 
     private void OnLogin()
@@ -748,17 +752,29 @@ internal partial class InterfaceManager : IInternalAsyncDisposableService
     /// <summary>Gets or initializes the game swap-chain backend and checks font readiness.</summary>
     /// <param name="swapChain">The presentation target.</param>
     /// <param name="flags">Flags passed to <see cref="IDXGISwapChain.Present"/>.</param>
-    /// <returns>The initialized backend, or <c>null</c> if the target or backend is not ready to draw.</returns>
+    /// <param name="target">The classification. It stays unknown until both output windows can be compared.</param>
+    /// <returns>The initialized backend, if any, and the readiness outcome.</returns>
     /// <remarks>The caller must hold <see cref="ThreadSafety.NativeFrameworkRenderSyncRoot"/>
     /// and <see cref="renderDalamudLock"/>.</remarks>
-    private unsafe IImGuiBackend? RenderDalamudCheckAndInitialize(IDXGISwapChain* swapChain, uint flags)
+    private unsafe (IImGuiBackend? Backend, FrameTimingOutcome Outcome) RenderDalamudCheckAndInitialize(
+        IDXGISwapChain* swapChain, uint flags, ref FrameTimingTarget target)
     {
         // Status probes do not submit a frame.
         if ((flags & DXGI.DXGI_PRESENT_TEST) != 0)
-            return null;
+            return (null, FrameTimingOutcome.Test);
 
-        if (!SwapChainHelper.IsGameDeviceSwapChain(swapChain))
-            return null;
+        if (!SwapChainHelper.IsGameDeviceSwapChain(swapChain, out var targetCompared))
+        {
+            if (targetCompared)
+            {
+                target = FrameTimingTarget.Other;
+                return (null, FrameTimingOutcome.OtherTarget);
+            }
+
+            return (null, FrameTimingOutcome.Skipped);
+        }
+
+        target = FrameTimingTarget.Display;
 
         Debug.Assert(this.dalamudAtlas is not null, "dalamudAtlas should have been set already");
 
@@ -766,7 +782,7 @@ internal partial class InterfaceManager : IInternalAsyncDisposableService
         if (activeBackend is null)
         {
             if (this.isInitializingBackend)
-                return null;
+                return (null, FrameTimingOutcome.BackendUnavailable);
 
             this.isInitializingBackend = true;
             try
@@ -787,10 +803,10 @@ internal partial class InterfaceManager : IInternalAsyncDisposableService
                 Util.Fatal("Failed to initialize Dalamud base fonts.\nPlease report this error.", "Dalamud");
             }
 
-            return null;
+            return (null, FrameTimingOutcome.BackendUnavailable);
         }
 
-        return activeBackend;
+        return (activeBackend, FrameTimingOutcome.Completed);
     }
 
     /// <summary>Serializes backend initialization and overlay rendering when framework admission succeeds.</summary>
@@ -798,40 +814,76 @@ internal partial class InterfaceManager : IInternalAsyncDisposableService
     /// <param name="flags">Flags passed to <see cref="IDXGISwapChain.Present"/>.</param>
     private unsafe void RenderDalamudDraw(IDXGISwapChain* swapChain, uint flags)
     {
+        var target = FrameTimingTarget.Unknown;
+        this.RenderTimedDalamudDraw(swapChain, flags, default, ref target);
+    }
+
+    private unsafe FrameTimingOutcome RenderTimedDalamudDraw(
+        IDXGISwapChain* swapChain, uint flags, FrameTimingProbe timing, ref FrameTimingTarget target)
+    {
         // Middleware may hold the device lock needed by Step; waiting here can deadlock.
         // Reject contention before backend initialization, counters, or queued work.
-        if (!ThreadSafety.NativeFrameworkRenderSyncRoot.TryEnter())
-            return;
-
+        var admission = timing.Begin(FrameTimingSpan.MainAdmission);
+        var frameworkAcquired = false;
         try
         {
-            using (this.renderDalamudLock.EnterScope())
+            using (var frameworkGuard = new FrameTimingSpanScope(timing.Begin(FrameTimingSpan.MainFrameworkGuard)))
             {
-                if (this.RenderDalamudCheckAndInitialize(swapChain, flags) is not { } activeBackend)
-                    return;
-
-                this.CumulativePresentCalls++;
-
-                this.PreImGuiRender();
-
-                // Secondary viewports require windowed mode and multiple monitors.
-                var viewportsDisabled = this.dalamudConfiguration.IsDisableViewport ||
-                                      activeBackend.IsMainViewportFullScreen() ||
-                                      ImGui.GetPlatformIO().Monitors.Size == 1;
-                if (viewportsDisabled)
-                    ImGui.GetIO().ConfigFlags &= ~ImGuiConfigFlags.ViewportsEnable;
-                else
-                    ImGui.GetIO().ConfigFlags |= ImGuiConfigFlags.ViewportsEnable;
-
-                // Render the captured frame; UI construction and Draw callbacks run during Step().
-                activeBackend.Render();
-
-                this.PostImGuiRender();
+                frameworkAcquired = ThreadSafety.NativeFrameworkRenderSyncRoot.TryEnter();
+                frameworkGuard.End(frameworkAcquired ? FrameTimingOutcome.Completed : FrameTimingOutcome.Contended);
             }
+
+            if (!frameworkAcquired)
+            {
+                admission.End(FrameTimingOutcome.Contended);
+                admission = default;
+                return FrameTimingOutcome.Contended;
+            }
+
+            using var renderGuard = new FrameTimingSpanScope(timing.Begin(FrameTimingSpan.MainRenderGuard));
+            using var renderLock = this.renderDalamudLock.EnterScope();
+            renderGuard.End();
+
+            var readiness = this.RenderDalamudCheckAndInitialize(swapChain, flags, ref target);
+            admission.End(readiness.Outcome, target);
+            admission = default;
+
+            if (readiness.Backend is not { } activeBackend)
+                return readiness.Outcome;
+
+            this.CumulativePresentCalls++;
+            timing.RecordPoint(FrameTimingSpan.MainReadyAttempt, FrameTimingTarget.Display);
+
+            using (var before = new FrameTimingSpanScope(timing.Begin(FrameTimingSpan.MainPreQueue), target))
+            {
+                this.PreImGuiRender();
+                before.End();
+            }
+
+            // Secondary viewports require windowed mode and multiple monitors.
+            var viewportsDisabled = this.dalamudConfiguration.IsDisableViewport ||
+                                    activeBackend.IsMainViewportFullScreen() ||
+                                    ImGui.GetPlatformIO().Monitors.Size == 1;
+            if (viewportsDisabled)
+                ImGui.GetIO().ConfigFlags &= ~ImGuiConfigFlags.ViewportsEnable;
+            else
+                ImGui.GetIO().ConfigFlags |= ImGuiConfigFlags.ViewportsEnable;
+
+            var outcome = activeBackend.Render(timing);
+
+            using (var after = new FrameTimingSpanScope(timing.Begin(FrameTimingSpan.MainPostQueue), target))
+            {
+                this.PostImGuiRender();
+                after.End();
+            }
+
+            return outcome;
         }
         finally
         {
-            ThreadSafety.NativeFrameworkRenderSyncRoot.Exit();
+            admission.End(FrameTimingOutcome.Failed, target);
+            if (frameworkAcquired)
+                ThreadSafety.NativeFrameworkRenderSyncRoot.Exit();
         }
     }
 
@@ -984,22 +1036,51 @@ internal partial class InterfaceManager : IInternalAsyncDisposableService
 
     private void KernelDeviceSwapChainPresentDetour(nint thisPtr)
     {
-        using var callback = this.callbackLifetime.Enter();
-        var original = callback.IsTracked ? this.kernelDeviceSwapchainPresentHook!.Original : this.kernelDeviceSwapchainPresentFallback!;
-
-        // Build UI once per game frame; presentation workers only render captured draw data.
-
+        var timing = FrameTimingRecorder.Instance.Begin(FrameTimingSource.KernelPresent, FrameTimingSpan.KernelPresent, out _);
+        var outcome = FrameTimingOutcome.Failed;
         try
         {
-            if (callback.CanUseBackend && this.backend is not null && this.dalamudAtlas!.HasBuiltAtlas)
-                this.backend.Step();
-        }
-        catch (Exception ex)
-        {
-            Log.Error(ex, "Exception in KernelDeviceSwapChainPresentDetour");
-        }
+            using var callback = this.callbackLifetime.Enter();
+            var original = callback.IsTracked ? this.kernelDeviceSwapchainPresentHook!.Original : this.kernelDeviceSwapchainPresentFallback!;
 
-        CallOriginalKernelDeviceSwapChainPresent(original, thisPtr);
+            // Build UI on the game thread before handing off to native Present.
+            var admission = timing.Begin(FrameTimingSpan.KernelStepAdmission);
+            var stepOutcome = FrameTimingOutcome.Failed;
+            try
+            {
+                if (!callback.CanUseBackend)
+                {
+                    stepOutcome = FrameTimingOutcome.Shutdown;
+                }
+                else if (this.backend is { } activeBackend && this.dalamudAtlas!.HasBuiltAtlas)
+                {
+                    admission.End();
+                    admission = default;
+                    stepOutcome = activeBackend.Step(timing);
+                }
+                else
+                {
+                    stepOutcome = FrameTimingOutcome.BackendUnavailable;
+                }
+            }
+            catch (Exception ex)
+            {
+                stepOutcome = FrameTimingOutcome.Failed;
+                Log.Error(ex, "Exception in KernelDeviceSwapChainPresentDetour");
+            }
+            finally
+            {
+                admission.End(stepOutcome);
+            }
+
+            // A failed step still reaches native Present, whose outcome is measured separately.
+            CallTimedOriginalKernelDeviceSwapChainPresent(original, thisPtr, timing);
+            outcome = stepOutcome;
+        }
+        finally
+        {
+            timing.End(outcome);
+        }
     }
 
     private void PreImGuiRender()

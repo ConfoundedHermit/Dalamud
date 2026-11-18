@@ -4,6 +4,7 @@ using System.Threading;
 using Dalamud.Interface.ImGuiBackend;
 using Dalamud.Interface.Internal.ReShadeHandling;
 using Dalamud.Utility;
+using Dalamud.Utility.Timing;
 
 using TerraFX.Interop.DirectX;
 using TerraFX.Interop.Windows;
@@ -132,24 +133,31 @@ internal unsafe partial class InterfaceManager
         ReadOnlySpan<RECT> destRect,
         ReadOnlySpan<RECT> dirtyRects)
     {
-        using var callback = this.callbackLifetime.Enter();
-        if (!callback.CanUseBackend)
-            return;
-
-        var swapChainNative = swapChain.GetNative<IDXGISwapChain>();
-
-        this.RenderDalamudDraw(swapChainNative, 0);
+        this.RenderReShadeAddonOverlay(ref swapChain, FrameTimingSource.ReShadePresent);
     }
 
     private void ReShadeAddonInterfaceOnReShadeOverlay(ref ReShadeAddonInterface.ApiObject runtime)
     {
-        using var callback = this.callbackLifetime.Enter();
-        if (!callback.CanUseBackend)
-            return;
+        this.RenderReShadeAddonOverlay(ref runtime, FrameTimingSource.ReShadeOverlay);
+    }
 
-        var swapChainNative = runtime.GetNative<IDXGISwapChain>();
-
-        this.RenderDalamudDraw(swapChainNative, 0);
+    private void RenderReShadeAddonOverlay(ref ReShadeAddonInterface.ApiObject sourceObject, FrameTimingSource source)
+    {
+        // Measure the delivered addon event. Native presentation runs outside this callback.
+        var timing = FrameTimingRecorder.Instance.Begin(source, FrameTimingSpan.OverlayCallback, out _);
+        var target = FrameTimingTarget.Unknown;
+        var outcome = FrameTimingOutcome.Failed;
+        try
+        {
+            using var callback = this.callbackLifetime.Enter();
+            outcome = callback.CanUseBackend
+                ? this.RenderTimedDalamudDraw(sourceObject.GetNative<IDXGISwapChain>(), 0, timing, ref target)
+                : FrameTimingOutcome.Shutdown;
+        }
+        finally
+        {
+            timing.End(outcome, target);
+        }
     }
 
     private int AsReShadeAddonDxgiSwapChainResizeBuffersDetour(

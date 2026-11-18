@@ -483,6 +483,10 @@ internal sealed class DalamudConfiguration : IInternalDisposableService
     /// </summary>
     public double UiBuilderHitch { get; set; } = 100;
 
+    /// <summary>Gets or sets a value indicating whether to start frame timing collection when Dalamud initializes.</summary>
+    /// <remarks>Defaults to <see langword="false"/>.</remarks>
+    public bool EnableFrameTimingOnStartup { get; set; }
+
     /// <summary>Gets or sets a value indicating whether to track texture allocation by plugins.</summary>
     public bool UseTexturePluginTracking { get; set; }
 

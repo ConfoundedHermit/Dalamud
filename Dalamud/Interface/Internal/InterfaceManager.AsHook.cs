@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 using Dalamud.Utility;
+using Dalamud.Utility.Timing;
 
 using TerraFX.Interop.DirectX;
 using TerraFX.Interop.Windows;
@@ -78,25 +79,56 @@ internal unsafe partial class InterfaceManager
         uint flags,
         DXGI_PRESENT_PARAMETERS* presentParams)
     {
-        using var callback = this.callbackLifetime.Enter();
-        var original = callback.IsTracked ? this.reShadeDxgiSwapChainPresentHook!.Original : this.reShadeDxgiSwapChainPresentFallback!;
+        var timing = FrameTimingRecorder.Instance.Begin(FrameTimingSource.LegacyReShadePresent, FrameTimingSpan.OverlayCallback, out _);
+        var target = FrameTimingTarget.Unknown;
+        var outcome = FrameTimingOutcome.Failed;
+        try
+        {
+            using var callback = this.callbackLifetime.Enter();
+            var original = callback.IsTracked ? this.reShadeDxgiSwapChainPresentHook!.Original : this.reShadeDxgiSwapChainPresentFallback!;
 
-        if (callback.CanUseBackend)
-            this.RenderDalamudDraw(swapChain->AsIDxgiSwapChain(), flags);
+            var overlayOutcome = callback.CanUseBackend
+                ? this.RenderTimedDalamudDraw(swapChain->AsIDxgiSwapChain(), flags, timing, ref target)
+                : FrameTimingOutcome.Shutdown;
 
-        // ReShade performs the system IDXGISwapChain::Present call.
-        original(swapChain, flags, presentParams);
+            // ReShade owns the system Present call. Time its handler as a separate boundary.
+            using var continuation = new FrameTimingSpanScope(timing.Begin(FrameTimingSpan.LegacyReShadeContinuation), target);
+            original(swapChain, flags, presentParams);
+            continuation.End();
+
+            outcome = overlayOutcome;
+        }
+        finally
+        {
+            timing.End(outcome, target);
+        }
     }
 
     private int DxgiSwapChainPresentDetour(IDXGISwapChain* swapChain, uint syncInterval, uint flags)
     {
-        using var callback = this.callbackLifetime.Enter();
-        var original = callback.IsTracked ? this.dxgiSwapChainPresentHook!.Original : this.dxgiSwapChainPresentFallback!;
+        var timing = FrameTimingRecorder.Instance.Begin(FrameTimingSource.DxgiPresent, FrameTimingSpan.OverlayCallback, out _);
+        var target = FrameTimingTarget.Unknown;
+        var outcome = FrameTimingOutcome.Failed;
+        try
+        {
+            using var callback = this.callbackLifetime.Enter();
+            var original = callback.IsTracked ? this.dxgiSwapChainPresentHook!.Original : this.dxgiSwapChainPresentFallback!;
 
-        if (callback.CanUseBackend)
-            this.RenderDalamudDraw(swapChain, flags);
+            var overlayOutcome = callback.CanUseBackend
+                ? this.RenderTimedDalamudDraw(swapChain, flags, timing, ref target)
+                : FrameTimingOutcome.Shutdown;
 
-        return original(swapChain, syncInterval, flags);
+            using var continuation = new FrameTimingSpanScope(timing.Begin(FrameTimingSpan.DxgiNativePresent), target);
+            var status = original(swapChain, syncInterval, flags);
+            // The native status belongs to the continuation. The callback outcome describes overlay work.
+            continuation.End(status >= 0 ? FrameTimingOutcome.Completed : FrameTimingOutcome.Failed, status);
+            outcome = overlayOutcome;
+            return status;
+        }
+        finally
+        {
+            timing.End(outcome, target);
+        }
     }
 
     private int AsHookDxgiSwapChainResizeBuffersDetour(

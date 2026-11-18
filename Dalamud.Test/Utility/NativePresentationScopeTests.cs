@@ -1,8 +1,10 @@
 using System;
+using System.Diagnostics;
 using System.Threading;
 
 using Dalamud.Test.Interface;
 using Dalamud.Utility;
+using Dalamud.Utility.Timing;
 
 using Xunit;
 
@@ -166,6 +168,48 @@ public class NativePresentationScopeTests
         finally
         {
             ReleaseCurrentThreadOwnership();
+        }
+    }
+
+    [Fact]
+    public void RecorderMeasuresOnlyRestorationOfReleasedOwnership()
+    {
+        var recorder = FrameTimingRecorder.Instance;
+        Assert.True(recorder.SetEnabled(true));
+        try
+        {
+            var present = recorder.Begin(FrameTimingSource.KernelPresent, FrameTimingSpan.KernelPresent, out _);
+            var syncRoot = ThreadSafety.NativeFrameworkRenderSyncRoot;
+            long beforeRestoration;
+            long afterRestoration;
+            using (syncRoot.EnterScope())
+            using (syncRoot.EnterScope())
+            {
+                using (ThreadSafety.EnterNativePresentation(present))
+                {
+                    using (ThreadSafety.EnterNativePresentation(present))
+                        Assert.False(syncRoot.IsHeldByCurrentThread);
+
+                    beforeRestoration = Stopwatch.GetTimestamp();
+                }
+
+                afterRestoration = Stopwatch.GetTimestamp();
+                Assert.True(syncRoot.IsHeldByCurrentThread);
+            }
+
+            present.End(FrameTimingOutcome.Completed);
+            Assert.False(syncRoot.IsHeldByCurrentThread);
+
+            var summary = recorder.ReadSummary();
+            Assert.NotNull(summary);
+            var reacquisition = Assert.Single(summary.Records, record => record.Span == FrameTimingSpan.FrameworkReacquisition);
+            Assert.Equal(FrameTimingOutcome.Completed, reacquisition.Outcome);
+            Assert.InRange(reacquisition.StartTick, beforeRestoration, afterRestoration);
+            Assert.InRange(reacquisition.EndTick, reacquisition.StartTick, afterRestoration);
+        }
+        finally
+        {
+            recorder.SetEnabled(false);
         }
     }
 

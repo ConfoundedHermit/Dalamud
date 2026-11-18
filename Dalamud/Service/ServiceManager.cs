@@ -463,7 +463,12 @@ internal static class ServiceManager
     /// Unloads global services before their dependencies, sharing one task across callers.
     /// </summary>
     /// <returns>A task that completes after all services have been unloaded.</returns>
-    public static Task UnloadAllServices() => UnloadTask.Value;
+    public static Task UnloadAllServices()
+    {
+        // Initialization failure can start teardown directly, so close timing admission here as well.
+        FrameTimingRecorder.Instance.Shutdown();
+        return UnloadTask.Value;
+    }
 
     /// <summary>
     /// Get the service type of this type.

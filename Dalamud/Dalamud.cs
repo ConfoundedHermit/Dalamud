@@ -130,6 +130,10 @@ internal sealed class Dalamud : IServiceType
                 "Dalamud", false);
         }
 
+        // Apply the preference before early services can install instrumented callbacks.
+        if (!FrameTimingRecorder.Instance.ApplyStartupPreference(configuration.EnableFrameTimingOnStartup))
+            Log.Warning("Could not start frame timing collection");
+
         ServiceManager.InitializeEarlyLoadableServices()
                       .ContinueWith(
                           t =>
@@ -198,6 +202,8 @@ internal sealed class Dalamud : IServiceType
     /// </summary>
     public void Unload()
     {
+        // Close timing admission before scheduling background teardown.
+        FrameTimingRecorder.Instance.Shutdown();
         Log.Information("Trigger unload");
 
         var reportCrashesSetting = Service<DalamudConfiguration>.GetNullable()?.ReportShutdownCrashes ?? true;

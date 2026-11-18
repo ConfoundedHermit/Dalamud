@@ -44,10 +44,9 @@ internal interface IImGuiRenderer : IDisposable
     /// Draws and presents a secondary viewport on the window-owning game thread.
     /// </summary>
     /// <remarks>
-    /// Call during <see cref="IImGuiBackend.Step"/>, before the native presentation handoff.
-    /// Present may synchronously message the window.
-    /// The caller must serialize access to the shared renderer and keep the live draw data, its borrowed resources,
-    /// and the renderer handle valid for the entire call. It must not be called for the main viewport.
+    /// Call during <see cref="IImGuiBackend.Step()"/> before the native presentation handoff because Present
+    /// may synchronously send messages to the secondary window. Serialize access to the shared renderer
+    /// and keep the draw data, borrowed resources, and renderer handle valid for the duration of the call.
     /// </remarks>
     /// <param name="rendererUserData">The viewport's borrowed <c>RendererUserData</c> handle.</param>
     /// <param name="drawData">The live draw data for the viewport.</param>

@@ -87,8 +87,15 @@ internal static unsafe class SwapChainHelper
     }
 
     /// <inheritdoc cref="IsGameDeviceSwapChain{T}"/>
-    public static bool IsGameDeviceSwapChain(IDXGISwapChain* punk)
+    public static bool IsGameDeviceSwapChain(IDXGISwapChain* punk) => IsGameDeviceSwapChain(punk, out _);
+
+    /// <summary>Compares the output windows of the target and game swap chains.</summary>
+    /// <param name="punk">The target swap chain.</param>
+    /// <param name="targetCompared"><c>true</c> if both descriptors could be read.</param>
+    /// <returns><c>true</c> if both descriptors identify the same output window.</returns>
+    public static bool IsGameDeviceSwapChain(IDXGISwapChain* punk, out bool targetCompared)
     {
+        targetCompared = false;
         DXGI_SWAP_CHAIN_DESC desc1;
         if (punk->GetDesc(&desc1).FAILED)
             return false;
@@ -97,6 +104,7 @@ internal static unsafe class SwapChainHelper
         if (GameDisplaySwapChain->GetDesc(&desc2).FAILED)
             return false;
 
+        targetCompared = true;
         return desc1.OutputWindow == desc2.OutputWindow;
     }
 

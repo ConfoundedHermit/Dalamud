@@ -1,11 +1,13 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -19,9 +21,12 @@ using Dalamud.Interface.ImGuiBackend.InputHandler;
 using Dalamud.Interface.ImGuiBackend.Renderers;
 using Dalamud.Interface.Internal;
 using Dalamud.Interface.Internal.ReShadeHandling;
+using Dalamud.Interface.ManagedFontAtlas;
 using Dalamud.Plugin.Services;
 using Dalamud.Utility;
+using Dalamud.Utility.Timing;
 
+using TerraFX.Interop.DirectX;
 using TerraFX.Interop.Windows;
 
 using Xunit;
@@ -144,6 +149,234 @@ public class InterfaceShutdownTests
         Assert.True(hook.IsDisposed);
     }
 
+    [Theory]
+    [InlineData(DXGI.DXGI_PRESENT_TEST, false, 7)]
+    [InlineData(0u, false, DXGI.DXGI_ERROR_INVALID_CALL)]
+    [InlineData(0u, true, 7)]
+    public void DxgiPresentRecordsAdmissionAndPreservesOriginalResult(uint flags, bool contended, int originalStatus)
+    {
+        using var presentation = new PresentationTestFixture();
+        using var fixture = new ShutdownFixture();
+        var recorder = FrameTimingRecorder.Instance;
+        FrameTimingSummary? duringOriginal = null;
+        var originalCalls = 0;
+        fixture.InstallHook(
+            "dxgiSwapChainPresentHook",
+            "dxgiSwapChainPresentFallback",
+            () =>
+            {
+                originalCalls++;
+                duringOriginal = recorder.ReadSummary();
+            },
+            () => throw new InvalidOperationException("Unexpected DXGI Present fallback."),
+            originalStatus);
+        var present = fixture.BindDetour<Func<nint, uint, uint, int>>("DxgiSwapChainPresentDetour");
+        var (expectedOutcome, expectedTarget, descriptorCalls) = (contended, flags) switch
+        {
+            (true, _) => (FrameTimingOutcome.Contended, FrameTimingTarget.Unknown, 0),
+            (false, DXGI.DXGI_PRESENT_TEST) => (FrameTimingOutcome.Test, FrameTimingTarget.Unknown, 0),
+            _ => (FrameTimingOutcome.OtherTarget, FrameTimingTarget.Other, 2),
+        };
+
+        Assert.True(recorder.SetEnabled(true));
+        try
+        {
+            int InvokePresent() => present(presentation.ForeignSwapChain, 0, flags);
+            var status = contended ? PresentWithFrameworkContention(InvokePresent) : InvokePresent();
+
+            Assert.Equal(originalStatus, status);
+            Assert.Equal(1, originalCalls);
+            Assert.Equal(descriptorCalls, presentation.DescriptorCalls);
+            Assert.NotNull(duringOriginal);
+            var entry = Assert.Single(duringOriginal.Records, record => record.Kind == FrameTimingRecordKind.Cadence);
+            Assert.Equal(FrameTimingSource.DxgiPresent, entry.Source);
+            Assert.DoesNotContain(duringOriginal.Records, record => record.Kind == FrameTimingRecordKind.Elapsed &&
+                record.Span is FrameTimingSpan.OverlayCallback or FrameTimingSpan.DxgiNativePresent);
+
+            var summary = recorder.ReadSummary()!;
+            var callback = AssertOverlayTiming(summary, FrameTimingSource.DxgiPresent, expectedOutcome, expectedTarget);
+            var native = Assert.Single(summary.Records, record => record.Span == FrameTimingSpan.DxgiNativePresent);
+            Assert.Equal(entry.OperationId, callback.OperationId);
+            Assert.Equal(entry.OperationId, native.OperationId);
+            Assert.Equal(FrameTimingSource.DxgiPresent, native.Source);
+            Assert.Equal(FrameTimingRecordKind.Elapsed, native.Kind);
+            Assert.Equal(expectedTarget, native.Target);
+            Assert.Equal(status, native.NativeStatus);
+            Assert.Equal(status >= 0 ? FrameTimingOutcome.Completed : FrameTimingOutcome.Failed, native.Outcome);
+            Assert.True(callback.StartTick <= native.StartTick && native.EndTick <= callback.EndTick);
+        }
+        finally
+        {
+            recorder.SetEnabled(false);
+        }
+    }
+
+    [Fact]
+    public void ReShadeCallbacksRecordDistinctCadenceSources()
+    {
+        using var presentation = new PresentationTestFixture();
+        using var fixture = new ShutdownFixture();
+        var originalCalls = 0;
+        fixture.InstallHook(
+            "reShadeDxgiSwapChainPresentHook",
+            "reShadeDxgiSwapChainPresentFallback",
+            () => originalCalls++,
+            () => throw new InvalidOperationException("Unexpected legacy ReShade Present fallback."));
+        var legacyPresent = fixture.BindDetour<Action<nint, uint, nint>>("ReShadeDxgiSwapChainOnPresentDetour");
+        var recorder = FrameTimingRecorder.Instance;
+        Assert.True(recorder.SetEnabled(true));
+        try
+        {
+            legacyPresent(presentation.ForeignSwapChain, 0, 0);
+            fixture.InvokeReShadeAddonPresentation(presentation.ForeignSwapChain);
+
+            var summary = recorder.ReadSummary()!;
+            var legacy = AssertOverlayTiming(summary, FrameTimingSource.LegacyReShadePresent, FrameTimingOutcome.OtherTarget, FrameTimingTarget.Other);
+            var present = AssertOverlayTiming(summary, FrameTimingSource.ReShadePresent, FrameTimingOutcome.OtherTarget, FrameTimingTarget.Other);
+            var overlay = AssertOverlayTiming(summary, FrameTimingSource.ReShadeOverlay, FrameTimingOutcome.OtherTarget, FrameTimingTarget.Other);
+            Assert.NotEqual(legacy.OperationId, present.OperationId);
+            Assert.NotEqual(legacy.OperationId, overlay.OperationId);
+            Assert.NotEqual(present.OperationId, overlay.OperationId);
+
+            var continuation = Assert.Single(summary.Records, record => record.Span == FrameTimingSpan.LegacyReShadeContinuation);
+            Assert.Equal(legacy.OperationId, continuation.OperationId);
+            Assert.Equal(FrameTimingSource.LegacyReShadePresent, continuation.Source);
+            Assert.Equal(FrameTimingOutcome.Completed, continuation.Outcome);
+            Assert.Equal(1, originalCalls);
+            Assert.All(summary.Records, record => Assert.Null(record.NativeStatus));
+        }
+        finally
+        {
+            recorder.SetEnabled(false);
+        }
+    }
+
+    [Fact]
+    public void KernelPresentKeepsCadenceAndCallsOriginalOnceAfterStepFails()
+    {
+        using var fixture = new ShutdownFixture();
+        fixture.PrepareStepBackend();
+        using var originalEntered = new ManualResetEventSlim();
+        using var releaseOriginal = new ManualResetEventSlim();
+        var originalCalls = 0;
+        var originalEntryTick = 0L;
+        fixture.InstallHook("kernelDeviceSwapchainPresentHook", "kernelDeviceSwapchainPresentFallback", () =>
+        {
+            originalCalls++;
+            originalEntryTick = Stopwatch.GetTimestamp();
+            originalEntered.Set();
+            Assert.True(releaseOriginal.Wait(WorkerTimeout));
+        }, () => throw new InvalidOperationException("Unexpected kernel Present fallback."));
+        var invoke = fixture.CreateDetourInvoker("KernelDeviceSwapChainPresentDetour");
+        Exception? workerFailure = null;
+        var worker = new Thread(() =>
+        {
+            try
+            {
+                // Invoke Step off the main thread to trigger its affinity check before graphics access.
+                invoke(false);
+            }
+            catch (Exception exception)
+            {
+                workerFailure = exception;
+            }
+        }) { IsBackground = true };
+
+        var recorder = FrameTimingRecorder.Instance;
+        Assert.True(recorder.SetEnabled(true));
+        try
+        {
+            var releaseTick = 0L;
+            worker.Start();
+            try
+            {
+                Assert.True(originalEntered.Wait(WorkerTimeout));
+                var stalled = recorder.ReadSummary()!;
+                Assert.Single(stalled.Records, record => record.Source == FrameTimingSource.KernelPresent && record.Kind == FrameTimingRecordKind.Cadence);
+                var step = Assert.Single(stalled.Records, record => record.Span == FrameTimingSpan.Step);
+                Assert.Equal(FrameTimingOutcome.Failed, step.Outcome);
+                Assert.DoesNotContain(stalled.Records, record => record.Span == FrameTimingSpan.KernelNativePresent);
+            }
+            finally
+            {
+                releaseTick = Stopwatch.GetTimestamp();
+                releaseOriginal.Set();
+                Assert.True(worker.Join(WorkerTimeout));
+            }
+
+            Assert.Null(workerFailure);
+            Assert.Equal(1, originalCalls);
+            var completed = recorder.ReadSummary()!;
+            var native = Assert.Single(completed.Records, record => record.Span == FrameTimingSpan.KernelNativePresent);
+            var kernel = Assert.Single(completed.Records, record => record.Span == FrameTimingSpan.KernelPresent && record.Kind == FrameTimingRecordKind.Elapsed);
+            Assert.Equal(FrameTimingOutcome.Completed, native.Outcome);
+            Assert.Equal(FrameTimingOutcome.Failed, kernel.Outcome);
+            Assert.Equal(kernel.OperationId, native.OperationId);
+            Assert.True(kernel.StartTick <= native.StartTick && native.StartTick <= originalEntryTick);
+            Assert.True(releaseTick <= native.EndTick && native.EndTick <= kernel.EndTick);
+        }
+        finally
+        {
+            recorder.SetEnabled(false);
+            Assert.True(fixture.ClearHooks().Wait(WorkerTimeout));
+        }
+    }
+
+    [Fact]
+    public void KernelPresentReportsSuspendedStepAndCallsOriginalOnceDuringResize()
+    {
+        using var fixture = new ShutdownFixture();
+        using var drawDataLock = new ReaderWriterLockSlim(LockRecursionPolicy.NoRecursion);
+        var backend = fixture.PrepareStepBackend(drawDataLock);
+        using var resize = backend.BeginResize();
+        var originalCalls = 0;
+        fixture.InstallHook(
+            "kernelDeviceSwapchainPresentHook",
+            "kernelDeviceSwapchainPresentFallback",
+            () => originalCalls++,
+            () => throw new InvalidOperationException("Unexpected kernel Present fallback."));
+        var invoke = fixture.CreateDetourInvoker("KernelDeviceSwapChainPresentDetour");
+        Exception? workerFailure = null;
+        var worker = new Thread(() =>
+        {
+            try
+            {
+                ThreadSafety.MarkMainThread();
+                invoke(false);
+            }
+            catch (Exception exception)
+            {
+                workerFailure = exception;
+            }
+        }) { IsBackground = true };
+
+        var recorder = FrameTimingRecorder.Instance;
+        Assert.True(recorder.SetEnabled(true));
+        try
+        {
+            worker.Start();
+            Assert.True(worker.Join(WorkerTimeout));
+            Assert.Null(workerFailure);
+            Assert.Equal(1, originalCalls);
+
+            var records = recorder.ReadSummary()!.Records;
+            var step = Assert.Single(records, record => record.Span == FrameTimingSpan.Step && record.Kind == FrameTimingRecordKind.Elapsed);
+            var kernel = Assert.Single(records, record => record.Span == FrameTimingSpan.KernelPresent && record.Kind == FrameTimingRecordKind.Elapsed);
+            var native = Assert.Single(records, record => record.Span == FrameTimingSpan.KernelNativePresent);
+            Assert.Equal(FrameTimingOutcome.Suspended, step.Outcome);
+            Assert.Equal(FrameTimingOutcome.Suspended, kernel.Outcome);
+            Assert.Equal(FrameTimingOutcome.Completed, native.Outcome);
+            Assert.Equal(kernel.OperationId, step.OperationId);
+            Assert.Equal(kernel.OperationId, native.OperationId);
+            Assert.DoesNotContain(records, record => record.Kind == FrameTimingRecordKind.Publication);
+        }
+        finally
+        {
+            recorder.SetEnabled(false);
+            Assert.True(fixture.ClearHooks().Wait(WorkerTimeout));
+        }
+    }
+
     [Fact]
     public void ClearHooksBeforeHookInstallationIsSafeAndIdempotent()
     {
@@ -162,11 +395,15 @@ public class InterfaceShutdownTests
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task ServiceUnloadYieldsFrameworkUntilOriginalContinuationAndPreservesDisposalOrder(bool startOnFrameworkThread)
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task ServiceUnloadYieldsFrameworkUntilOriginalContinuationAndPreservesDisposalOrder(
+        bool startOnFrameworkThread, bool recordingEnabled)
     {
         using var fixture = new ShutdownFixture();
+        var recorder = FrameTimingRecorder.Instance;
         var framework = (Framework)fixture.GetField("framework")!;
         using var dispatcher = new FrameworkDispatcher(framework);
         // Let the test coordinator yield its pool thread while queued unload work makes progress.
@@ -180,8 +417,10 @@ public class InterfaceShutdownTests
         var windowCallbackEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var releaseWindowCallback = new ManualResetEventSlim();
         var order = new ConcurrentQueue<string>();
+        var originalCalls = 0;
         var hook = fixture.InstallHook("dxgiSwapChainPresentHook", "dxgiSwapChainPresentFallback", () =>
         {
+            Interlocked.Increment(ref originalCalls);
             originalEntered.TrySetResult();
             Assert.True(hooksDetached.Wait(WorkerTimeout), "Service unload did not detach interception.");
 
@@ -201,6 +440,7 @@ public class InterfaceShutdownTests
             order.Enqueue("resources");
             resourcesDisposed.Set();
         });
+        Assert.True(recorder.SetEnabled(recordingEnabled));
         var worker = Task.Factory.StartNew(() => invoke(false), CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         Task? unload = null;
         Task? windowCallback = null;
@@ -208,9 +448,13 @@ public class InterfaceShutdownTests
         try
         {
             await originalEntered.Task.WaitAsync(WorkerTimeout);
+            var admitted = recorder.ReadSummary();
+            Assert.Equal(recordingEnabled, admitted?.Collecting ?? false);
 
             Task BeginUnload()
             {
+                // Close admission at unload entry with a reversible disable for the shared recorder.
+                recorder.SetEnabled(false);
                 // Exercise service ordering with the real interface disposer and isolated neighboring services.
                 var result = ServiceManager.UnloadServices(framework,
                 [
@@ -247,9 +491,22 @@ public class InterfaceShutdownTests
             await frameworkWorkRan.Task.WaitAsync(WorkerTimeout);
             Assert.False(worker.IsCompleted);
             Assert.False(unload.IsCompleted);
+            var hookCleanup = Assert.IsAssignableFrom<Task>(fixture.GetField("hookCleanupTask"));
+            Assert.False(hookCleanup.IsCompleted);
             Assert.False(hook.IsDisposed);
             Assert.False(resourcesDisposed.IsSet);
             Assert.False(followingServiceDisposed.IsSet);
+
+            var draining = recorder.ReadSummary(admitted?.SessionId);
+            Assert.False(draining?.Collecting ?? false);
+            if (recordingEnabled)
+            {
+                Assert.NotNull(draining);
+                Assert.Single(draining.Records, record => record.Source == FrameTimingSource.DxgiPresent &&
+                    record.Kind == FrameTimingRecordKind.Cadence);
+                Assert.DoesNotContain(draining.Records, record => record.Kind == FrameTimingRecordKind.Elapsed &&
+                    record.Span is FrameTimingSpan.OverlayCallback or FrameTimingSpan.DxgiNativePresent);
+            }
 
             // Secondary WndProc callbacks are outside the hook drain; owner-thread dispatch must serialize teardown.
             windowCallback = framework.RunOnFrameworkThread(() =>
@@ -259,9 +516,10 @@ public class InterfaceShutdownTests
                 Assert.False(resourcesDisposed.IsSet);
             });
             await windowCallbackEntered.Task.WaitAsync(WorkerTimeout);
+            var releaseTick = Stopwatch.GetTimestamp();
             releaseOriginal.Set();
             await worker.WaitAsync(WorkerTimeout);
-            await ((Task)fixture.GetField("hookCleanupTask")!).WaitAsync(WorkerTimeout);
+            await hookCleanup.WaitAsync(WorkerTimeout);
             Assert.False(resourcesDisposed.IsSet);
             Assert.False(unload.IsCompleted);
             releaseWindowCallback.Set();
@@ -270,7 +528,24 @@ public class InterfaceShutdownTests
             Assert.True(hook.IsDisposed);
             Assert.True(resourcesDisposed.IsSet);
             Assert.True(followingServiceDisposed.IsSet);
+            Assert.Equal(1, originalCalls);
             Assert.Equal(new[] { "preceding service", "detach", "resources", "following service" }, order.ToArray());
+
+            var completed = recorder.ReadSummary(admitted?.SessionId);
+            if (recordingEnabled)
+            {
+                Assert.NotNull(completed);
+                var callback = AssertOverlayTiming(completed, FrameTimingSource.DxgiPresent, FrameTimingOutcome.Test, FrameTimingTarget.Unknown);
+                var native = Assert.Single(completed.Records, record => record.Span == FrameTimingSpan.DxgiNativePresent);
+                Assert.Equal(callback.OperationId, native.OperationId);
+                Assert.Equal(FrameTimingOutcome.Completed, native.Outcome);
+                Assert.Equal(7, native.NativeStatus);
+                Assert.True(callback.StartTick <= native.StartTick && releaseTick <= native.EndTick && native.EndTick <= callback.EndTick);
+            }
+            else
+            {
+                Assert.Equal(admitted?.Records.Length, completed?.Records.Length);
+            }
         }
         finally
         {
@@ -284,6 +559,7 @@ public class InterfaceShutdownTests
             }
             finally
             {
+                recorder.SetEnabled(false);
                 // Unload can resume this continuation on the dispatcher; return to the pool before joining it.
                 await Task.CompletedTask.ConfigureAwait(ConfigureAwaitOptions.ForceYielding);
             }
@@ -376,6 +652,58 @@ public class InterfaceShutdownTests
         Assert.True(followingStarted);
     }
 
+    private static int PresentWithFrameworkContention(Func<int> present)
+    {
+        var status = 0;
+        ExceptionDispatchInfo? workerFailure = null;
+        var worker = new Thread(() =>
+        {
+            try
+            {
+                status = present();
+            }
+            catch (Exception exception)
+            {
+                workerFailure = ExceptionDispatchInfo.Capture(exception);
+            }
+        }) { IsBackground = true };
+
+        bool returnedWhileFrameworkHeld;
+        using (ThreadSafety.NativeFrameworkRenderSyncRoot.EnterScope())
+        {
+            worker.Start();
+            returnedWhileFrameworkHeld = worker.Join(WorkerTimeout);
+        }
+
+        if (!returnedWhileFrameworkHeld)
+            Assert.True(worker.Join(WorkerTimeout), "DXGI Present did not finish after framework release.");
+
+        Assert.True(returnedWhileFrameworkHeld, "DXGI Present waited on framework admission.");
+        workerFailure?.Throw();
+        return status;
+    }
+
+    private static FrameTimingRecord AssertOverlayTiming(
+        FrameTimingSummary summary, FrameTimingSource source, FrameTimingOutcome outcome, FrameTimingTarget target)
+    {
+        var entry = Assert.Single(summary.Records, record => record.Source == source && record.Kind == FrameTimingRecordKind.Cadence);
+        Assert.Equal(FrameTimingSpan.OverlayCallback, entry.Span);
+        var callback = Assert.Single(summary.Records, record => record.Source == source && record.Kind == FrameTimingRecordKind.Elapsed &&
+            record.Span == FrameTimingSpan.OverlayCallback);
+        Assert.Equal(entry.OperationId, callback.OperationId);
+        Assert.Equal(entry.StartTick, callback.StartTick);
+        Assert.Equal(outcome, callback.Outcome);
+        Assert.Equal(target, callback.Target);
+        Assert.Null(callback.NativeStatus);
+
+        var admission = Assert.Single(summary.Records, record => record.OperationId == entry.OperationId && record.Span == FrameTimingSpan.MainAdmission);
+        Assert.Equal(FrameTimingRecordKind.Elapsed, admission.Kind);
+        Assert.Equal(source, admission.Source);
+        Assert.Equal(outcome, admission.Outcome);
+        Assert.Equal(target, admission.Target);
+        return callback;
+    }
+
     private delegate void ReShadeObjectCallback(ref ReShadeAddonInterface.ApiObject value);
 
     private delegate void ReShadePresentCallback(
@@ -385,7 +713,7 @@ public class InterfaceShutdownTests
         ReadOnlySpan<RECT> destRect,
         ReadOnlySpan<RECT> dirtyRects);
 
-    private interface IFakeHook : IDalamudHook
+    internal interface IFakeHook : IDalamudHook
     {
         int DisableCalls { get; }
     }
@@ -415,7 +743,7 @@ public class InterfaceShutdownTests
         public override void Enable() => throw new NotSupportedException();
     }
 
-    private sealed class ShutdownFixture : IDisposable
+    internal sealed class ShutdownFixture : IDisposable
     {
         private const BindingFlags PrivateInstance = BindingFlags.Instance | BindingFlags.NonPublic;
         private static readonly Lazy<nint[]> AssertionLibraries = new(() => LoadAssertionLibraries());
@@ -455,9 +783,25 @@ public class InterfaceShutdownTests
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         private delegate int GetDescCallback(nint swapChain, nint desc);
 
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate nint GetNativeCallback(nint apiObject);
+
+        public InterfaceManager Manager => this.manager;
+
         public Task ClearHooks() => this.clearHooks();
 
         public Task DisposeServiceAsync() => ((IInternalAsyncDisposableService)this.manager).DisposeServiceAsync();
+
+        public Dx11Win32Backend PrepareStepBackend(ReaderWriterLockSlim? drawDataLock = null)
+        {
+            this.SetField("dalamudAtlas", DispatchProxy.Create<IFontAtlas, PresentationTestFixture.ReadyAtlasProxy>());
+            var backend = Uninitialized<Dx11Win32Backend>();
+            if (drawDataLock is not null)
+                typeof(Dx11Win32Backend).GetField("drawDataLock", PrivateInstance)!.SetValue(backend, drawDataLock);
+
+            this.SetField("backend", backend);
+            return backend;
+        }
 
         public void PrepareServiceDisposal(Action onBackendDispose)
         {
@@ -507,11 +851,33 @@ public class InterfaceShutdownTests
                 .CreateDelegate<Action<IFramework>>(this.manager)(null!);
         }
 
-        public IFakeHook InstallHook(string hookField, string fallbackField, Action original, Action fallback)
+        public void InvokeReShadeAddonPresentation(nint swapChain)
+        {
+            // Both addon callbacks use GetNative, the first vtable slot.
+            GetNativeCallback getNative = _ => swapChain;
+            var vtable = Marshal.AllocHGlobal(nint.Size);
+            try
+            {
+                Marshal.WriteIntPtr(vtable, Marshal.GetFunctionPointerForDelegate(getNative));
+                var target = Unsafe.As<nint, ReShadeAddonInterface.ApiObject>(ref vtable);
+                var runtime = target;
+                typeof(InterfaceManager).GetMethod("ReShadeAddonInterfaceOnPresent", PrivateInstance)!
+                    .CreateDelegate<ReShadePresentCallback>(this.manager)(ref runtime, ref target, [], [], []);
+                typeof(InterfaceManager).GetMethod("ReShadeAddonInterfaceOnReShadeOverlay", PrivateInstance)!
+                    .CreateDelegate<ReShadeObjectCallback>(this.manager)(ref runtime);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(vtable);
+                GC.KeepAlive(getNative);
+            }
+        }
+
+        public IFakeHook InstallHook(string hookField, string fallbackField, Action original, Action fallback, int originalStatus = 7)
         {
             var hookType = typeof(InterfaceManager).GetField(hookField, PrivateInstance)!.FieldType;
             var delegateType = hookType.GetGenericArguments()[0];
-            var originalDelegate = MakeContinuation(delegateType, original);
+            var originalDelegate = MakeContinuation(delegateType, original, originalStatus);
             var hook = (IFakeHook)typeof(FakeHook<>).MakeGenericType(delegateType)
                 .GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)[0]
                 .Invoke([originalDelegate]);
@@ -520,7 +886,7 @@ public class InterfaceShutdownTests
             return hook;
         }
 
-        public Action<bool> CreateDetourInvoker(string name)
+        public T BindDetour<T>(string name) where T : Delegate
         {
             var method = typeof(InterfaceManager).GetMethod(name, PrivateInstance)!;
             var argumentTypes = method.GetParameters().Select(parameter => parameter.ParameterType.IsPointer
@@ -532,24 +898,28 @@ public class InterfaceShutdownTests
                 il.Emit(OpCodes.Ldarg, (short)index);
             il.Emit(OpCodes.Call, method);
             il.Emit(OpCodes.Ret);
+            return adapter.CreateDelegate<T>(this.manager);
+        }
 
+        public Action<bool> CreateDetourInvoker(string name)
+        {
             switch (name)
             {
                 case "DxgiSwapChainPresentDetour":
-                    var present = adapter.CreateDelegate<Func<nint, uint, uint, int>>(this.manager);
+                    var present = this.BindDetour<Func<nint, uint, uint, int>>(name);
                     return late => Assert.Equal(7, present(0, 0, late ? 0u : 1u));
                 case "ReShadeDxgiSwapChainOnPresentDetour":
-                    var reShadePresent = adapter.CreateDelegate<Action<nint, uint, nint>>(this.manager);
+                    var reShadePresent = this.BindDetour<Action<nint, uint, nint>>(name);
                     return late => reShadePresent(0, late ? 0u : 1u, 0);
                 case "AsHookDxgiSwapChainResizeBuffersDetour":
                 case "AsReShadeAddonDxgiSwapChainResizeBuffersDetour":
-                    var resize = adapter.CreateDelegate<Func<nint, uint, uint, uint, int, uint, int>>(this.manager);
+                    var resize = this.BindDetour<Func<nint, uint, uint, uint, int, uint, int>>(name);
                     return late => Assert.Equal(7, resize(late ? 0 : this.swapChain, 0, 0, 0, 0, 0));
                 case "KernelDeviceSwapChainPresentDetour":
-                    var kernel = adapter.CreateDelegate<Action<nint>>(this.manager);
+                    var kernel = this.BindDetour<Action<nint>>(name);
                     return _ => kernel(0);
                 case "SetCursorDetour":
-                    var cursor = adapter.CreateDelegate<Func<nint, nint>>(this.manager);
+                    var cursor = this.BindDetour<Func<nint, nint>>(name);
                     return _ => Assert.Equal((nint)7, cursor(0));
                 default:
                     throw new ArgumentOutOfRangeException(nameof(name));
@@ -570,7 +940,7 @@ public class InterfaceShutdownTests
             return instance;
         }
 
-        private static Delegate MakeContinuation(Type delegateType, Action action)
+        private static Delegate MakeContinuation(Type delegateType, Action action, int returnValue = 7)
         {
             var signature = delegateType.GetMethod("Invoke")!;
             var parameters = signature.GetParameters().Select(parameter => parameter.ParameterType).ToArray();
@@ -580,7 +950,7 @@ public class InterfaceShutdownTests
             il.Emit(OpCodes.Callvirt, typeof(Action).GetMethod(nameof(Action.Invoke))!);
             if (signature.ReturnType != typeof(void))
             {
-                il.Emit(OpCodes.Ldc_I4_7);
+                il.Emit(OpCodes.Ldc_I4, returnValue);
                 if (signature.ReturnType == typeof(nint))
                     il.Emit(OpCodes.Conv_I);
             }
@@ -664,6 +1034,8 @@ public class InterfaceShutdownTests
         public void Dispose() => onDispose();
 
         public void Step() => throw new NotSupportedException();
+
+        public FrameTimingOutcome Step(FrameTimingProbe probe) => throw new NotSupportedException();
 
         public void Render() => throw new NotSupportedException();
 

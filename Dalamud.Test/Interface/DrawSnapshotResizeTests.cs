@@ -16,8 +16,8 @@ public class DrawSnapshotResizeTests
     {
         using var fixture = new BackendFixture();
 
-        fixture.Backend.Render();
-        fixture.Backend.Render();
+        fixture.Render();
+        fixture.Render();
 
         fixture.AssertLocksReleased();
     }
@@ -156,18 +156,18 @@ public class DrawSnapshotResizeTests
         // Enable replay so the rendererless fixture detects a draw attempt before resize.
         typeof(Dx11Win32Backend).GetField("hasSnapshot", BindingFlags.Instance | BindingFlags.NonPublic)?
             .SetValue(fixture.Backend, true);
-        Assert.Throws<NullReferenceException>(fixture.Backend.Render);
+        Assert.Throws<NullReferenceException>(fixture.Render);
         fixture.AssertLocksReleased();
 
         using (fixture.Backend.BeginResize())
         {
             Assert.True(fixture.Backend.IsResizeInProgress);
-            fixture.Backend.Render();
+            fixture.Render();
         }
 
         Assert.False(fixture.Backend.IsResizeInProgress);
-        fixture.Backend.Render();
-        fixture.Backend.Render();
+        fixture.Render();
+        fixture.Render();
 
         fixture.AssertLocksReleased();
     }
@@ -184,7 +184,7 @@ public class DrawSnapshotResizeTests
         (disposeOuterFirst ? outer : inner).Dispose();
 
         Assert.True(fixture.Backend.IsResizeInProgress);
-        fixture.Backend.Render();
+        fixture.Render();
         fixture.AssertLocksReleased();
 
         (disposeOuterFirst ? inner : outer).Dispose();
@@ -221,7 +221,7 @@ public class DrawSnapshotResizeTests
         RunOnWorker(previous.Dispose);
 
         Assert.True(fixture.Backend.IsResizeInProgress);
-        fixture.Backend.Render();
+        fixture.Render();
 
         current.Dispose();
         Assert.False(fixture.Backend.IsResizeInProgress);
@@ -338,7 +338,7 @@ public class DrawSnapshotResizeTests
             Assert.True(acquired.Wait(TimeSpan.FromSeconds(5), cancellationToken));
             outer.Dispose();
             Assert.True(fixture.Backend.IsResizeInProgress);
-            fixture.Backend.Render();
+            fixture.Render();
             fixture.AssertLocksReleased();
         }
         finally
@@ -387,7 +387,7 @@ public class DrawSnapshotResizeTests
                 Assert.False(acquired.IsSet);
 
                 // Pending resize suppresses new work before existing readers drain.
-                fixture.Backend.Render();
+                fixture.Render();
                 var callbackInvoked = false;
                 Assert.False(fixture.Backend.TryReadViewportBackBuffer(1, _ => callbackInvoked = true));
                 Assert.False(callbackInvoked);
@@ -450,6 +450,9 @@ public class DrawSnapshotResizeTests
         public Dx11Win32Backend Backend { get; }
 
         public ReaderWriterLockSlim DrawDataLock => this.drawDataLock;
+
+        // Use a disabled probe so replay tests are independent of recorder state.
+        public void Render() => this.Backend.Render(default);
 
         public void Dispose()
         {

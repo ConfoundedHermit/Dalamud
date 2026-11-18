@@ -53,10 +53,11 @@ internal sealed class PresentationTestFixture : IDisposable
     /// Whether to bypass backend construction. When enabled, unset configuration causes rendering to fail
     /// after queue dispatch and before native ImGui access; otherwise, construction fails at GetDevice.
     /// </param>
-    public PresentationTestFixture(bool initialized = false)
+    /// <param name="manager">An optional manager whose callback state the fixture reuses.</param>
+    public PresentationTestFixture(bool initialized = false, InterfaceManager? manager = null)
     {
         // Supply only the manager state used by admission and queued presentation work.
-        this.Manager = (InterfaceManager)RuntimeHelpers.GetUninitializedObject(typeof(InterfaceManager));
+        this.Manager = manager ?? (InterfaceManager)RuntimeHelpers.GetUninitializedObject(typeof(InterfaceManager));
         GC.SuppressFinalize(this.Manager);
         this.SetField("renderDalamudLock", this.RenderLock);
         this.SetField("runBeforeImGuiRender", this.BeforeRender);
@@ -153,6 +154,10 @@ internal sealed class PresentationTestFixture : IDisposable
     public int ConstructorCalls => Volatile.Read(ref this.constructorCalls);
 
     public int ReferenceCount => Volatile.Read(ref this.references);
+
+    public nint SwapChain => this.swapChain;
+
+    public nint ForeignSwapChain => this.foreignSwapChain;
 
     public void Present(uint flags = 0) => this.present(this.Manager, this.swapChain, flags);
 

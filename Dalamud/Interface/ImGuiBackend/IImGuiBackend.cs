@@ -1,6 +1,7 @@
 using Dalamud.Interface.ImGuiBackend.Delegates;
 using Dalamud.Interface.ImGuiBackend.InputHandler;
 using Dalamud.Interface.ImGuiBackend.Renderers;
+using Dalamud.Utility.Timing;
 
 namespace Dalamud.Interface.ImGuiBackend;
 
@@ -13,7 +14,7 @@ internal interface IImGuiBackend : IDisposable
     /// <summary>User methods invoked every ImGui frame on handling inputs.</summary>
     event ImGuiNewInputFrameDelegate? NewInputFrame;
 
-    /// <summary>Invoked during <see cref="Step"/> before input processing and UI construction.</summary>
+    /// <summary>Invoked during <see cref="Step()"/> before input processing and UI construction.</summary>
     event ImGuiNewRenderFrameDelegate? NewRenderFrame;
 
     /// <summary>Invoked after main capture and secondary presentation to retire previous-frame resources.</summary>
@@ -42,11 +43,16 @@ internal interface IImGuiBackend : IDisposable
 
     /// <summary>Builds the ImGui frame, captures the main snapshot, and draws and presents secondary windows.</summary>
     /// <remarks>
-    /// Call on the game thread before the native presentation handoff; DXGI may synchronously message secondary windows.
-    /// A resize can skip the step or discard its capture. Rendered frames still complete platform updates under
-    /// write exclusion when capture is discarded.
+    /// Call on the game thread before the native presentation handoff. A resize can skip the step.
+    /// If resize overlaps UI construction, the step completes ImGui platform updates under write exclusion
+    /// and discards the capture.
     /// </remarks>
     void Step();
+
+    /// <inheritdoc cref="Step()"/>
+    /// <param name="probe">The kernel Present timing probe.</param>
+    /// <returns>Whether the step published a snapshot or was suspended by resize.</returns>
+    FrameTimingOutcome Step(FrameTimingProbe probe);
 
     /// <summary>Renders the latest main snapshot.</summary>
     /// <remarks>
@@ -54,6 +60,18 @@ internal interface IImGuiBackend : IDisposable
     /// and until a complete capture built after that resize is available.
     /// </remarks>
     void Render();
+
+    /// <inheritdoc cref="Render()"/>
+    /// <param name="probe">The presentation callback timing probe.</param>
+    /// <returns>
+    /// The replay outcome. The default implementation reports <see cref="FrameTimingOutcome.Completed"/>
+    /// when <see cref="Render()"/> returns normally.
+    /// </returns>
+    FrameTimingOutcome Render(FrameTimingProbe probe)
+    {
+        this.Render();
+        return FrameTimingOutcome.Completed;
+    }
 
     /// <summary>Reads a viewport's back buffer while excluding renderer mutations and swap-chain reallocation.</summary>
     /// <remarks>

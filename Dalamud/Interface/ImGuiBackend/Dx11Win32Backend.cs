@@ -10,6 +10,7 @@ using Dalamud.Interface.ImGuiBackend.InputHandler;
 using Dalamud.Interface.ImGuiBackend.Renderers;
 using Dalamud.Interface.Internal;
 using Dalamud.Utility;
+using Dalamud.Utility.Timing;
 
 using Serilog;
 
@@ -50,8 +51,9 @@ internal sealed unsafe class Dx11Win32Backend : IWin32Backend
     private bool implotImGuiContextSet;
     private bool disposed;
 
-    // Protected by drawDataLock; replay is allowed only after a complete capture.
+    // Protected by drawDataLock. Timing metadata belongs to the same published draw data.
     private bool hasSnapshot;
+    private FrameTimingSnapshot snapshotTiming;
 
     // Detects resize during UI construction, which runs outside drawDataLock.
     private long resizeGeneration;
@@ -249,108 +251,16 @@ internal sealed unsafe class Dx11Win32Backend : IWin32Backend
         this.imguiInput.ProcessWndProcW(hWnd, msg, wParam, lParam);
 
     /// <inheritdoc/>
-    public void Step()
-    {
-        ThreadSafety.AssertMainThread();
-
-        // Sample before callbacks to detect resize even if it finishes during UI construction.
-        var generation = Volatile.Read(ref this.resizeGeneration);
-
-        if (this.IsResizeInProgress)
-            return;
-
-        this.imguiRenderer.OnNewFrame();
-        this.NewRenderFrame?.Invoke();
-        this.imguiInput.NewFrame(this.targetWidth, this.targetHeight);
-        this.NewInputFrame?.Invoke();
-
-        ImGui.NewFrame();
-        ImGuizmo.BeginFrame();
-
-        // Build live UI before acquiring snapshot write access. Resources referenced by the previous snapshot
-        // must remain valid until retirement, even if UI construction requests their disposal.
-        this.BuildUi?.Invoke();
-
-        ImGui.Render();
-
-        // Complete platform updates, main capture, and secondary presentation under write exclusion.
-        // Native factory hooks may acquire the device lock, so enter it first to preserve lock ordering.
-        using var deviceLock = new DeviceLock(this);
-        this.drawDataLock.EnterWriteLock();
-        try
-        {
-            // Platform-window mutation or a partial copy can invalidate the previous snapshot even if Step fails.
-            this.hasSnapshot = false;
-
-            // ImGui requires platform completion before the next NewFrame, even if resize discards this capture.
-            ImGui.UpdatePlatformWindows();
-
-            // Discard construction overlapping resize without publishing or advancing resource retirement.
-            if (this.IsResizeInProgress || generation != Volatile.Read(ref this.resizeGeneration))
-                return;
-
-            this.snapshot.CopyFrom(ImGui.GetDrawData().Handle);
-
-            // Present may synchronously message the secondary HWND, so draw and present on its owning thread
-            // before the kernel Present handoff. Write exclusion keeps live viewport data and resources stable.
-            var viewports = ImGui.GetPlatformIO().Viewports;
-            for (var i = 1; i < viewports.Size; i++)
-            {
-                var viewport = viewports[i];
-
-                if ((viewport.Flags & ImGuiViewportFlags.Minimized) != 0)
-                    continue;
-
-                var rendererUserData = (nint)viewport.RendererUserData;
-                if (rendererUserData == nint.Zero)
-                    continue;
-
-                this.imguiRenderer.RenderViewport(rendererUserData, viewport.DrawData);
-            }
-
-            // Retire previous-frame resources after replay readers drain and live secondary drawing completes.
-            this.PostCopy?.Invoke();
-
-            // Publish only after main capture, secondary presentation, and retirement succeed.
-            this.hasSnapshot = true;
-        }
-        finally
-        {
-            this.drawDataLock.ExitWriteLock();
-        }
-    }
+    public void Step() => this.MeasureStep(FrameTimingRecorder.Instance.Begin(FrameTimingSpan.Step, out _));
 
     /// <inheritdoc/>
-    public void Render()
-    {
-        // Skip work while resize is announced, including the interval between resource callbacks.
-        if (this.IsResizeInProgress)
-            return;
+    public FrameTimingOutcome Step(FrameTimingProbe probe) => this.MeasureStep(probe.Begin(FrameTimingSpan.Step));
 
-        using (new DeviceLock(this))
-        using (this.renderLock.EnterScope())
-        {
-            // Resize may have been announced while waiting for the graphics locks.
-            if (this.IsResizeInProgress)
-                return;
+    /// <inheritdoc/>
+    public void Render() => this.MeasureRender(FrameTimingRecorder.Instance.Begin(FrameTimingSpan.MainRender, out _));
 
-            // Hold the main snapshot stable for the complete render pass.
-            this.drawDataLock.EnterReadLock();
-            try
-            {
-                // Resize invalidates the captured presentation target; wait for a complete, fresh capture.
-                if (this.IsResizeInProgress || !this.hasSnapshot)
-                    return;
-
-                // The main snapshot may be composited once for every generated frame.
-                this.imguiRenderer.RenderDrawData(new ImDrawDataPtr(this.snapshot.Handle));
-            }
-            finally
-            {
-                this.drawDataLock.ExitReadLock();
-            }
-        }
-    }
+    /// <inheritdoc/>
+    public FrameTimingOutcome Render(FrameTimingProbe probe) => this.MeasureRender(probe.Begin(FrameTimingSpan.MainRender));
 
     /// <inheritdoc/>
     public bool TryReadViewportBackBuffer(uint viewportId, Action<nint> reader)
@@ -517,6 +427,168 @@ internal sealed unsafe class Dx11Win32Backend : IWin32Backend
         }
     }
 
+    private FrameTimingOutcome MeasureStep(FrameTimingProbe step)
+    {
+        using var span = new FrameTimingSpanScope(step);
+        var outcome = this.StepCore(step);
+        span.End(outcome);
+        return outcome;
+    }
+
+    private FrameTimingOutcome StepCore(FrameTimingProbe step)
+    {
+        ThreadSafety.AssertMainThread();
+
+        // Sample before callbacks to detect resize even if it finishes during UI construction.
+        var generation = Volatile.Read(ref this.resizeGeneration);
+
+        if (this.IsResizeInProgress)
+            return FrameTimingOutcome.Suspended;
+
+        using (var uiBuild = new FrameTimingSpanScope(step.Begin(FrameTimingSpan.UiBuild)))
+        {
+            this.imguiRenderer.OnNewFrame();
+            this.NewRenderFrame?.Invoke();
+            this.imguiInput.NewFrame(this.targetWidth, this.targetHeight);
+            this.NewInputFrame?.Invoke();
+
+            ImGui.NewFrame();
+            ImGuizmo.BeginFrame();
+
+            // Build live UI before acquiring snapshot write access. Resources referenced by the previous snapshot
+            // must remain valid until retirement, even if UI construction requests their disposal.
+            this.BuildUi?.Invoke();
+            uiBuild.End();
+        }
+
+        // Replay age is measured from draw-data finalization, even if publication occurs later.
+        long finalizedTick;
+        using (var uiFinalize = new FrameTimingSpanScope(step.Begin(FrameTimingSpan.UiFinalize)))
+        {
+            ImGui.Render();
+            finalizedTick = uiFinalize.End();
+        }
+
+        // Complete platform updates, main capture, and secondary presentation under write exclusion.
+        // Native factory hooks may acquire the device lock, so enter it first to preserve lock ordering.
+        using var deviceLock = new DeviceLock(this, step.Begin(FrameTimingSpan.StepDeviceGuard));
+        using var writer = new FrameTimingSpanScope(step.Begin(FrameTimingSpan.StepWriterGuard));
+        this.drawDataLock.EnterWriteLock();
+        try
+        {
+            writer.End();
+
+            // Platform-window mutation or a partial copy can invalidate the previous snapshot even if Step fails.
+            this.hasSnapshot = false;
+
+            // ImGui requires platform completion before the next NewFrame, even if resize discards this capture.
+            using (var platform = new FrameTimingSpanScope(step.Begin(FrameTimingSpan.Platform)))
+            {
+                ImGui.UpdatePlatformWindows();
+                platform.End();
+            }
+
+            // Discard construction overlapping resize without publishing or advancing resource retirement.
+            if (this.IsResizeInProgress || generation != Volatile.Read(ref this.resizeGeneration))
+                return FrameTimingOutcome.Suspended;
+
+            using (var copy = new FrameTimingSpanScope(step.Begin(FrameTimingSpan.SnapshotCopy)))
+            {
+                this.snapshot.CopyFrom(ImGui.GetDrawData().Handle);
+                copy.End();
+            }
+
+            // Keep live secondary draw data and its resources stable through presentation.
+            var secondary = step.Begin(FrameTimingSpan.SecondaryWork);
+            using (var secondaryWork = new FrameTimingSpanScope(secondary))
+            {
+                var viewports = ImGui.GetPlatformIO().Viewports;
+                for (var i = 1; i < viewports.Size; i++)
+                {
+                    var viewport = viewports[i];
+
+                    if ((viewport.Flags & ImGuiViewportFlags.Minimized) != 0)
+                        continue;
+
+                    var rendererUserData = (nint)viewport.RendererUserData;
+                    if (rendererUserData == nint.Zero)
+                        continue;
+
+                    this.imguiRenderer.RenderViewport(rendererUserData, viewport.DrawData, secondary);
+                }
+
+                secondaryWork.End();
+            }
+
+            // Retire previous-frame resources after replay readers drain and live secondary drawing completes.
+            using (var retirement = new FrameTimingSpanScope(step.Begin(FrameTimingSpan.Retirement)))
+            {
+                this.PostCopy?.Invoke();
+                retirement.End();
+            }
+
+            // Publish only after main capture, secondary presentation, and retirement succeed.
+            this.snapshotTiming = step.CreateSnapshot(finalizedTick);
+            this.hasSnapshot = true;
+            step.RecordPublication(this.snapshotTiming);
+            return FrameTimingOutcome.Completed;
+        }
+        finally
+        {
+            this.drawDataLock.ExitWriteLock();
+        }
+    }
+
+    private FrameTimingOutcome MeasureRender(FrameTimingProbe render)
+    {
+        using var span = new FrameTimingSpanScope(render, FrameTimingTarget.Display);
+        var outcome = this.RenderCore(render);
+        span.End(outcome);
+        return outcome;
+    }
+
+    private FrameTimingOutcome RenderCore(FrameTimingProbe render)
+    {
+        // Skip work while resize is announced, including the interval between resource callbacks.
+        if (this.IsResizeInProgress)
+            return FrameTimingOutcome.Suspended;
+
+        const FrameTimingTarget target = FrameTimingTarget.Display;
+        using var deviceLock = new DeviceLock(this, render.Begin(FrameTimingSpan.ReplayDeviceGuard), target);
+        using var renderGuard = new FrameTimingSpanScope(render.Begin(FrameTimingSpan.ReplayRenderGuard), target);
+        using var renderLock = this.renderLock.EnterScope();
+        renderGuard.End();
+
+        // Resize may have been announced while waiting for the graphics locks.
+        if (this.IsResizeInProgress)
+            return FrameTimingOutcome.Suspended;
+
+        // Hold the main snapshot stable for the complete render pass.
+        using var reader = new FrameTimingSpanScope(render.Begin(FrameTimingSpan.ReplayReaderGuard), target);
+        this.drawDataLock.EnterReadLock();
+        try
+        {
+            reader.End();
+
+            // Resize invalidates the captured presentation target; wait for a complete, fresh capture.
+            if (this.IsResizeInProgress)
+                return FrameTimingOutcome.Suspended;
+
+            if (!this.hasSnapshot)
+                return FrameTimingOutcome.MissingSnapshot;
+
+            // A normal renderer return counts as a replay even for empty draw data.
+            using var replay = new FrameTimingSpanScope(render.Begin(FrameTimingSpan.MainReplay), target, this.snapshotTiming);
+            this.imguiRenderer.RenderDrawData(new ImDrawDataPtr(this.snapshot.Handle));
+            replay.End();
+            return FrameTimingOutcome.Completed;
+        }
+        finally
+        {
+            this.drawDataLock.ExitReadLock();
+        }
+    }
+
     private void EndResize()
     {
         this.drawDataLock.EnterWriteLock();
@@ -613,11 +685,18 @@ internal sealed unsafe class Dx11Win32Backend : IWin32Backend
     {
         private readonly ID3D11Multithread* multithread;
 
-        public DeviceLock(Dx11Win32Backend backend)
+        public DeviceLock(
+            Dx11Win32Backend backend,
+            FrameTimingProbe probe = default,
+            FrameTimingTarget target = FrameTimingTarget.Unknown)
         {
+            using var acquisition = new FrameTimingSpanScope(probe, target);
             this.multithread = backend.deviceMultithread.Get();
             if (this.multithread is null)
+            {
+                acquisition.End(FrameTimingOutcome.Skipped);
                 return;
+            }
 
             this.multithread->Enter();
 
@@ -625,6 +704,8 @@ internal sealed unsafe class Dx11Win32Backend : IWin32Backend
             // policy before context use and remember disabled-to-enabled transitions for disposal.
             if (backend.enableMultithreadProtection && !this.multithread->SetMultithreadProtected(BOOL.TRUE))
                 backend.restoreMultithreadProtection = true;
+
+            acquisition.End();
         }
 
         public void Dispose()

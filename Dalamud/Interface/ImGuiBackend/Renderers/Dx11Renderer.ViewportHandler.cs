@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.ImGuiBackend.Helpers;
 using Dalamud.Utility;
+using Dalamud.Utility.Timing;
 
 using TerraFX.Interop.DirectX;
 using TerraFX.Interop.Windows;
@@ -321,13 +322,18 @@ internal unsafe partial class Dx11Renderer
                 clearRenderTarget);
         }
 
-        public void PresentIfSwapChainAvailable()
+        public void PresentIfSwapChainAvailable(FrameTimingProbe probe = default)
         {
             if (this.width < 1 || this.height < 1)
                 return;
 
-            if (!this.swapChain.IsEmpty())
-                this.swapChain.Get()->Present(0, 0).ThrowOnError();
+            if (this.swapChain.IsEmpty())
+                return;
+
+            using var present = new FrameTimingSpanScope(probe.Begin(FrameTimingSpan.SecondaryPresent));
+            var status = this.swapChain.Get()->Present(0, 0);
+            present.End(status.FAILED ? FrameTimingOutcome.Failed : FrameTimingOutcome.Completed, (int)status);
+            status.ThrowOnError();
         }
 
         public void ResetBuffers()

@@ -1,7 +1,10 @@
 using System;
+using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 
 using Dalamud.Utility;
+using Dalamud.Utility.Timing;
 
 using TerraFX.Interop.DirectX;
 
@@ -120,26 +123,99 @@ public class BackendInitializationAdmissionTests
         Assert.Null(fixture.Manager.Backend);
     }
 
-    [Fact]
-    public void ReentrantPresentationDoesNotConstructAnotherBackend()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ReentrantPresentationDoesNotConstructAnotherBackend(bool recording)
     {
-        using var fixture = new PresentationTestFixture();
+        const int originalStatus = 17;
+        using var shutdown = new InterfaceShutdownTests.ShutdownFixture();
+        using var fixture = new PresentationTestFixture(manager: shutdown.Manager);
+        var originalCalls = 0;
+        shutdown.InstallHook(
+            "dxgiSwapChainPresentHook",
+            "dxgiSwapChainPresentFallback",
+            () => originalCalls++,
+            () => throw new InvalidOperationException("Unexpected DXGI Present fallback."),
+            originalStatus);
+        var present = shutdown.BindDetour<Func<nint, uint, uint, int>>("DxgiSwapChainPresentDetour");
+        int Present() => present(fixture.SwapChain, 0, 0);
+
+        // Reenter the detour before the outer call can publish a backend.
         fixture.DuringConstruction = () =>
         {
             if (fixture.ConstructorCalls == 1)
-                fixture.Present();
+                Assert.Equal(originalStatus, Present());
             Assert.Equal(1, fixture.ConstructorCalls);
             Assert.Null(fixture.Manager.Backend);
             Assert.True(ThreadSafety.NativeFrameworkRenderSyncRoot.IsHeldByCurrentThread);
             Assert.True(fixture.RenderLock.IsHeldByCurrentThread);
         };
 
-        AssertInitializationFails(fixture);
-        fixture.CallbackFailure?.Throw();
-        Assert.Equal(1, fixture.ConstructorCalls);
-        Assert.Equal(1, fixture.ReferenceCount);
-        Assert.False(ThreadSafety.NativeFrameworkRenderSyncRoot.IsHeldByCurrentThread);
-        Assert.False(fixture.RenderLock.IsHeldByCurrentThread);
+        var recorder = FrameTimingRecorder.Instance;
+        Assert.True(recorder.SetEnabled(recording));
+        try
+        {
+            var before = recorder.ReadSummary();
+            var failure = Assert.ThrowsAny<Exception>(() => Present());
+            Assert.Equal(PresentationTestFixture.InitializationError, failure.HResult);
+            fixture.CallbackFailure?.Throw();
+            Assert.Equal(1, fixture.ConstructorCalls);
+            Assert.Equal(1, fixture.ReferenceCount);
+            Assert.Equal(1, originalCalls);
+            Assert.Equal(0, fixture.Manager.CumulativePresentCalls);
+            Assert.Null(fixture.Manager.Backend);
+            Assert.False(ThreadSafety.NativeFrameworkRenderSyncRoot.IsHeldByCurrentThread);
+            Assert.False(fixture.RenderLock.IsHeldByCurrentThread);
+
+            var after = recorder.ReadSummary();
+            if (!recording)
+            {
+                Assert.Equal(before?.SessionId, after?.SessionId);
+                if (before is not null)
+                    Assert.Equal<FrameTimingRecord>(before.Records, after!.Records);
+                return;
+            }
+
+            Assert.NotNull(before);
+            Assert.NotNull(after);
+            Assert.Equal(before.SessionId, after.SessionId);
+            var entries = after.Records.Where(record => record.Kind == FrameTimingRecordKind.Cadence).ToArray();
+            Assert.Equal(2, entries.Length);
+            var callbacks = after.Records.Where(record => record.Kind == FrameTimingRecordKind.Elapsed &&
+                record.Span == FrameTimingSpan.OverlayCallback).ToArray();
+            Assert.Equal(2, callbacks.Length);
+            var outer = Assert.Single(callbacks, record => record.Outcome == FrameTimingOutcome.Failed);
+            var inner = Assert.Single(callbacks, record => record.Outcome == FrameTimingOutcome.BackendUnavailable);
+            Assert.NotEqual(outer.OperationId, inner.OperationId);
+            Assert.True(outer.StartTick <= inner.StartTick && inner.EndTick <= outer.EndTick);
+
+            foreach (var callback in callbacks)
+            {
+                var entry = Assert.Single(entries, record => record.OperationId == callback.OperationId);
+                Assert.Equal(FrameTimingSource.DxgiPresent, entry.Source);
+                Assert.Equal(FrameTimingSource.DxgiPresent, callback.Source);
+                Assert.Equal(FrameTimingSpan.OverlayCallback, entry.Span);
+                Assert.Equal(entry.StartTick, callback.StartTick);
+                Assert.Equal(FrameTimingTarget.Display, callback.Target);
+                var admission = Assert.Single(after.Records, record => record.OperationId == callback.OperationId &&
+                    record.Span == FrameTimingSpan.MainAdmission);
+                Assert.Equal(callback.Outcome, admission.Outcome);
+            }
+
+            var native = Assert.Single(after.Records, record => record.Span == FrameTimingSpan.DxgiNativePresent);
+            Assert.Equal(inner.OperationId, native.OperationId);
+            Assert.Equal(FrameTimingSource.DxgiPresent, native.Source);
+            Assert.Equal(FrameTimingRecordKind.Elapsed, native.Kind);
+            Assert.Equal(FrameTimingOutcome.Completed, native.Outcome);
+            Assert.Equal(originalStatus, native.NativeStatus);
+            Assert.True(inner.StartTick <= native.StartTick && native.EndTick <= inner.EndTick);
+        }
+        finally
+        {
+            recorder.SetEnabled(false);
+            await shutdown.ClearHooks().WaitAsync(WorkerTimeout);
+        }
     }
 
     [Theory]

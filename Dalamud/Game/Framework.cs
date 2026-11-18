@@ -14,6 +14,7 @@ using Dalamud.Plugin.Internal;
 using Dalamud.Plugin.Internal.Types;
 using Dalamud.Plugin.Services;
 using Dalamud.Utility;
+using Dalamud.Utility.Timing;
 
 using CSFramework = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework;
 
@@ -417,14 +418,27 @@ internal sealed class Framework : IInternalDisposableService, IFramework
 
     private unsafe bool HandleFrameworkUpdate(CSFramework* thisPtr)
     {
-        this.RunFrameworkTick();
+        var update = FrameTimingRecorder.Instance.Begin(FrameTimingSource.FrameworkUpdate, FrameTimingSpan.FrameworkUpdate, out _);
+        using var duration = new FrameTimingSpanScope(update);
+        using (var managed = new FrameTimingSpanScope(update.Begin(FrameTimingSpan.FrameworkManagedTick)))
+        {
+            this.RunFrameworkTick();
+            managed.End();
+        }
 
-        // Exclude worker renders from native UI updates and finalization.
-        // The kernel Present detour suspends this lock's ownership only while native presentation runs.
+        // Serialize native UI updates and finalization with worker rendering.
+        using var acquisition = new FrameTimingSpanScope(update.Begin(FrameTimingSpan.FrameworkGuard));
+        bool result;
         using (ThreadSafety.NativeFrameworkRenderSyncRoot.EnterScope())
         {
-            return this.updateHook.OriginalDisposeSafe(thisPtr);
+            acquisition.End();
+            using var native = new FrameTimingSpanScope(update.Begin(FrameTimingSpan.FrameworkNativeUpdate));
+            result = this.updateHook.OriginalDisposeSafe(thisPtr);
+            native.End(nativeStatus: result ? 1 : 0);
         }
+
+        duration.End();
+        return result;
     }
 
     private unsafe void RunFrameworkTick()

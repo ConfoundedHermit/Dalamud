@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using System.Threading;
 
 using Dalamud.Configuration.Internal;
+using Dalamud.Utility.Timing;
 
 namespace Dalamud.Utility;
 
@@ -22,9 +23,9 @@ public static class ThreadSafety
     /// Gets the lock that serializes native framework updates and main-thread draw-list rendering with presentation work.
     /// </summary>
     /// <remarks>
-    /// Kernel Present releases all game-thread recursion levels until native presentation returns.
-    /// Presentation callbacks must acquire without waiting: they may hold the device lock needed by the owner.
-    /// The managed framework tick runs before native-update acquisition; draw-list rendering takes its own scope.
+    /// <see cref="EnterNativePresentation"/> suspends ownership across the native kernel Present call.
+    /// Presentation callbacks must acquire without waiting because they may hold the device lock needed by the owner.
+    /// The managed framework tick runs before native-update acquisition. Draw-list rendering takes its own scope.
     /// </remarks>
     internal static Lock NativeFrameworkRenderSyncRoot { get; } = new();
 
@@ -67,9 +68,11 @@ public static class ThreadSafety
     /// <summary>
     /// Releases the calling thread's native-update lock ownership until disposal.
     /// </summary>
+    /// <param name="timing">The kernel Present probe used to measure reacquisition, if recording.</param>
     /// <returns>A scope that restores every released recursion level when disposed on the calling thread.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static NativePresentationScope EnterNativePresentation() => new(NativeFrameworkRenderSyncRoot);
+    internal static NativePresentationScope EnterNativePresentation(FrameTimingProbe timing = default)
+        => new(NativeFrameworkRenderSyncRoot, timing);
 
     /// <summary>
     /// Throws an exception when the current thread is not the main thread and DevMode is enabled.
@@ -101,13 +104,16 @@ public static class ThreadSafety
     internal readonly ref struct NativePresentationScope
     {
         private readonly Lock syncRoot;
+        private readonly FrameTimingProbe timing;
         private readonly int recursionDepth;
 
         /// <summary>Initializes a new instance of the <see cref="NativePresentationScope"/> struct.</summary>
         /// <param name="syncRoot">The native-update lock whose calling-thread ownership is suspended.</param>
-        internal NativePresentationScope(Lock syncRoot)
+        /// <param name="timing">The optional probe to which the reacquisition span belongs.</param>
+        internal NativePresentationScope(Lock syncRoot, FrameTimingProbe timing)
         {
             this.syncRoot = syncRoot;
+            this.timing = timing;
 
             var depth = 0;
             while (syncRoot.IsHeldByCurrentThread)
@@ -119,11 +125,17 @@ public static class ThreadSafety
             this.recursionDepth = depth;
         }
 
-        /// <summary>Restores every released recursion level.</summary>
+        /// <summary>Restores every released recursion level and measures reacquisition when timing is enabled.</summary>
         public void Dispose()
         {
+            if (this.recursionDepth == 0)
+                return;
+
+            using var reacquisition = new FrameTimingSpanScope(this.timing.Begin(FrameTimingSpan.FrameworkReacquisition));
             for (var depth = 0; depth < this.recursionDepth; depth++)
                 this.syncRoot.Enter();
+
+            reacquisition.End();
         }
     }
 }

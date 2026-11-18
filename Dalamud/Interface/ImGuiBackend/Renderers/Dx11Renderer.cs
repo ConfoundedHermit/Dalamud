@@ -16,6 +16,7 @@ using Dalamud.Interface.Textures.TextureWraps;
 using Dalamud.Interface.Textures.TextureWraps.Internal;
 using Dalamud.Interface.Utility;
 using Dalamud.Utility;
+using Dalamud.Utility.Timing;
 
 using TerraFX.Interop.DirectX;
 using TerraFX.Interop.Windows;
@@ -168,7 +169,14 @@ internal unsafe partial class Dx11Renderer : IImGuiRenderer
         this.mainViewport.Draw(drawData, this.mainViewport.SwapChain == null);
 
     /// <inheritdoc/>
-    public void RenderViewport(nint rendererUserData, ImDrawDataPtr drawData)
+    public void RenderViewport(nint rendererUserData, ImDrawDataPtr drawData) =>
+        this.RenderViewport(rendererUserData, drawData, default);
+
+    /// <inheritdoc cref="IImGuiRenderer.RenderViewport"/>
+    /// <param name="rendererUserData">The viewport's borrowed renderer handle.</param>
+    /// <param name="drawData">The viewport's live draw data.</param>
+    /// <param name="probe">The timing probe for secondary viewport work in this step.</param>
+    public void RenderViewport(nint rendererUserData, ImDrawDataPtr drawData, FrameTimingProbe probe)
     {
         ThreadSafety.AssertMainThread();
 
@@ -186,8 +194,13 @@ internal unsafe partial class Dx11Renderer : IImGuiRenderer
             return;
         }
 
-        vp.Draw(drawData, true);
-        vp.PresentIfSwapChainAvailable();
+        using (var draw = new FrameTimingSpanScope(probe.Begin(FrameTimingSpan.SecondaryDraw)))
+        {
+            vp.Draw(drawData, true);
+            draw.End();
+        }
+
+        vp.PresentIfSwapChainAvailable(probe);
     }
 
     /// <summary>
