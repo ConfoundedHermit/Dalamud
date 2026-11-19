@@ -72,7 +72,7 @@ After review and CI, land the PR with a merge commit so the next sync can recogn
 
 ## Fork releases
 
-Assembly versioning and Git tag names are separate. `Dalamud/Dalamud.csproj` defines the pinned `DalamudVersion` for each revision. Existing upstream tag `15.0.4.0` identifies `51b4552f6` and must retain that target. Fork release tags use the date-based format **`dalamud-plus/vYYYYMMDD`**, with a positive numeric suffix for another release on the same date, such as `dalamud-plus/v20261116-2`.
+`Dalamud/Dalamud.csproj` defines the framework version through `DalamudVersion`. Fork release tags use the date-based format **`dalamud-plus/vYYYYMMDD`**, with a positive numeric suffix for another release on the same date, such as `dalamud-plus/v20261116-2`.
 
 From a clean, reviewed `main`, create an annotated date tag locally:
 
@@ -82,7 +82,7 @@ From a clean, reviewed `main`, create an annotated date tag locally:
 .\tools\release.ps1 -TagName dalamud-plus/v20261116-2
 ```
 
-The helper validates the calendar date and reads the pinned framework version for the annotation. It leaves the project, index, and current commit unchanged and never pushes. Review the tag, build and test that exact revision, and push the selected branch and tag explicitly when ready. Publish a GitHub release against the existing fork tag only after that review.
+The helper validates the calendar date and reads `DalamudVersion` from the project for the tag annotation. It leaves the project, index, and current commit unchanged and never pushes. Review the tag, build and test that exact revision, and push the selected branch and tag explicitly when ready. Publish a GitHub release against the existing fork tag only after that review.
 
 The release workflow requires the fork tag prefix, a tagged revision containing the original integration commit, and that revision's inclusion in remote `main` history. These checks reject clean upstream mirror revisions and tags unrelated to the fork. The workflow builds/tests and uploads `Dalamud-win-x64.zip` and its SHA-256 companion to the release in `github.repository`. It uses the job's `GITHUB_TOKEN` with `contents: write`.
 
