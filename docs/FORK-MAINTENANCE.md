@@ -39,28 +39,40 @@ The upstream `tag-build.yml` and `rollup.yml` workflows are removed from `main`:
 
 ## Ingest upstream changes
 
-Start with a clean worktree. Run each command separately, checking its result:
+Review the PR from `upstream-sync.yml` when the workflow can merge cleanly. If it stops on a merge conflict, prepare a separate integration branch from the current fork `main`. Start with a clean worktree and check each command's result before continuing.
 
 ```powershell
-git fetch --no-tags goatcorp
+git fetch --no-tags origin
+git fetch --no-tags goatcorp master
 git switch master
+git merge-base --is-ancestor master goatcorp/master
 git merge --ff-only goatcorp/master
-git diff --exit-code master goatcorp/master
-git switch main
+$integrationBranch = "integration/upstream-$(git rev-parse --short master)"
+git switch -c $integrationBranch origin/main
 git merge --no-ff master
+```
+
+Stop if upstream history cannot fast-forward `master`. Resolve any conflicts on the integration branch and commit the merge there. Review the upstream delta, fork behavior, workflows, version property, and runtime changes. Carry forward the fork's workflow adaptations and retain repository-level controls for the retired workflows still present on `master`.
+
+```powershell
 git submodule update --init --recursive
 .\generate.cmd vs2026
 .\build.cmd Release
 dotnet test Dalamud.Test/Dalamud.Test.csproj -c Release -tl:off -p:WarningLevel=0
 ```
 
-Resolve any integration conflict on `main`, then review the upstream delta, fork behavior, workflows, version property, and runtime changes. Stop if upstream history cannot fast-forward `master`; investigate rather than resetting or force pushing. Carry forward the fork's workflow adaptations when merging upstream automation changes, and retain repository-level controls for the retired workflows still present on `master`.
+If the fork's remote mirror needs advancing, fast-forward it with `git push origin master:master`. Confirm the remote `main` is still the base used to build the candidate, then publish the integration branch and open a draft PR for review.
 
-After review and validation, update the fork's remote mirror with `git push origin master:master`, and the development branch with `git push origin main:main`. The mirror push retains exact upstream commits. Do not commit fork documentation, versions, or workflow edits on `master`.
+```powershell
+git push -u origin $integrationBranch
+gh pr create --repo ConfoundedHermit/DalamudPlus --base main --head $integrationBranch --draft
+```
+
+After review and CI, land the PR with a merge commit so the next sync can recognize the imported upstream history. Keep `master` identical to upstream.
 
 ## Fork releases
 
-Assembly versioning and Git tag names are separate. The pinned `DalamudVersion` remains **15.0.4.0**. Existing upstream tag `15.0.4.0` identifies `51b4552f6` and must retain that target. Fork releases use date-based tags: **`dalamud-plus/vYYYYMMDD`**, with a positive numeric suffix for another release on the same date, such as `dalamud-plus/v20261116-2`.
+Assembly versioning and Git tag names are separate. `Dalamud/Dalamud.csproj` defines the pinned `DalamudVersion` for each revision. Existing upstream tag `15.0.4.0` identifies `51b4552f6` and must retain that target. Fork release tags use the date-based format **`dalamud-plus/vYYYYMMDD`**, with a positive numeric suffix for another release on the same date, such as `dalamud-plus/v20261116-2`.
 
 From a clean, reviewed `main`, create an annotated date tag locally:
 
