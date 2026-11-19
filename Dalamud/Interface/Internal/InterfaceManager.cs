@@ -107,6 +107,7 @@ internal partial class InterfaceManager : IInternalAsyncDisposableService
 
     private Task? hookCleanupTask;
     private IWin32Backend? backend;
+    private volatile FrameTimingSource frameTimingOverlaySource;
     // Recursive presentation locks allow reentry, so construction needs a separate guard.
     private bool isInitializingBackend;
 
@@ -183,6 +184,9 @@ internal partial class InterfaceManager : IInternalAsyncDisposableService
     /// </summary>
     public event Action? DefaultStyleChanged;
 
+    /// <summary>Raised on the game thread when a UI build skips <see cref="Draw"/> dispatch.</summary>
+    internal event Action? DrawSuppressed;
+
     /// <summary>
     /// Gets the default ImGui font.<br />
     /// <strong>Accessing this static property outside of the main thread is dangerous and not supported.</strong>
@@ -240,6 +244,9 @@ internal partial class InterfaceManager : IInternalAsyncDisposableService
     /// Gets the DX11 scene.
     /// </summary>
     public IImGuiBackend? Backend => this.backend;
+
+    /// <summary>Gets the installed overlay callback source, or <see cref="FrameTimingSource.None"/> when unavailable.</summary>
+    internal FrameTimingSource FrameTimingOverlaySource => this.frameTimingOverlaySource;
 
     /// <summary>
     /// Gets or sets a value indicating whether the game's cursor should be overridden with the ImGui cursor.
@@ -676,6 +683,7 @@ internal partial class InterfaceManager : IInternalAsyncDisposableService
                 return this.hookCleanupTask;
 
             this.callbackLifetime.Stop();
+            this.frameTimingOverlaySource = FrameTimingSource.None;
             this.framework.Update -= this.FrameworkOnUpdate;
             this.wndProcHookManager.PreWndProc -= this.WndProcHookManagerOnPreWndProc;
             if (this.reShadeAddonInterface is { } addon)
@@ -1456,9 +1464,13 @@ internal partial class InterfaceManager : IInternalAsyncDisposableService
         this.dxgiSwapChainHook?.Enable();
         this.kernelDeviceSwapchainPresentHook.Enable();
 
-        // Set up ReShade callbacks after we are sure we are set
+        // Report the selected overlay source once its hook is enabled or its addon callback is subscribed.
         if (this.reShadeAddonInterface is null)
         {
+            if (this.dxgiSwapChainPresentHook is not null)
+                this.frameTimingOverlaySource = FrameTimingSource.DxgiPresent;
+            else if (this.reShadeDxgiSwapChainPresentHook is not null)
+                this.frameTimingOverlaySource = FrameTimingSource.LegacyReShadePresent;
             return;
         }
 
@@ -1467,10 +1479,12 @@ internal partial class InterfaceManager : IInternalAsyncDisposableService
         if (this.dalamudConfiguration.ReShadeHandlingMode == ReShadeHandlingMode.ReShadeAddonPresent)
         {
             this.reShadeAddonInterface.Present += this.ReShadeAddonInterfaceOnPresent;
+            this.frameTimingOverlaySource = FrameTimingSource.ReShadePresent;
         }
         else
         {
             this.reShadeAddonInterface.ReShadeOverlay += this.ReShadeAddonInterfaceOnReShadeOverlay;
+            this.frameTimingOverlaySource = FrameTimingSource.ReShadeOverlay;
         }
     }
 
@@ -1615,6 +1629,10 @@ internal partial class InterfaceManager : IInternalAsyncDisposableService
             }
 
             Service<NotificationManager>.GetNullable()?.Draw();
+        }
+        else
+        {
+            this.DrawSuppressed?.Invoke();
         }
     }
 

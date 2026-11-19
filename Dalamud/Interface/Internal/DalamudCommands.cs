@@ -83,6 +83,11 @@ internal class DalamudCommands : IServiceType
             HelpMessage = Loc.Localize("DalamudPluginStats", "Draw plugin statistics window"),
         });
 
+        commandManager.AddHandler("/xlframetimes", new CommandInfo(this.OnOpenFrameTimingMonitor)
+        {
+            HelpMessage = Loc.Localize("DalamudFrameTimingMonitor", "Open the Frame Timing Monitor"),
+        });
+
         commandManager.AddHandler("/xlbranch", new CommandInfo(this.OnToggleBranchSwitcher)
         {
             HelpMessage = Loc.Localize("DalamudBranchSwitcher", "Open the branch switcher"),
@@ -277,6 +282,11 @@ internal class DalamudCommands : IServiceType
     private void OnTogglePluginStats(string command, string arguments)
     {
         Service<DalamudInterface>.Get().TogglePluginStatsWindow();
+    }
+
+    private void OnOpenFrameTimingMonitor(string command, string arguments)
+    {
+        Service<DalamudInterface>.Get().OpenFrameTimingMonitor();
     }
 
     private void OnToggleBranchSwitcher(string command, string arguments)

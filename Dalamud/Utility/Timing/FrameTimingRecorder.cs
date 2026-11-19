@@ -22,26 +22,29 @@ internal sealed class FrameTimingRecorder(int capacity = 32 * 1024, Action<Frame
     /// <summary>Gets the recorder shared by the game's timing probes.</summary>
     internal static FrameTimingRecorder Instance { get; } = new();
 
+    /// <summary>Gets a value indicating whether the recorder currently admits probes.</summary>
+    internal bool IsEnabled => Volatile.Read(ref this.admission) is FrameTimingSession;
+
     /// <summary>Starts collection when requested by the startup preference.</summary>
     /// <param name="enabled">Whether to begin collection at startup.</param>
     /// <returns><c>true</c> if collection was unrequested or could be enabled.</returns>
     internal bool ApplyStartupPreference(bool enabled) => !enabled || this.SetEnabled(true);
 
-    /// <summary>Enables or disables collection. Call off the rendering path.</summary>
+    /// <summary>Enables collection or detaches the active session without waiting for owners to release it.</summary>
+    /// <remarks>Enable collection off the rendering path.</remarks>
     /// <param name="enabled">Whether to collect timing records.</param>
     /// <param name="beforeEnableCommit">An optional callback before the prepared session is published.</param>
     /// <param name="afterEnableCommit">An optional callback after publication and before this call initializes the start tick.</param>
     /// <returns>Whether the request succeeded. An enable can fail if shutdown has begun or storage is unavailable.</returns>
     internal bool SetEnabled(bool enabled, Action? beforeEnableCommit = null, Action? afterEnableCommit = null)
     {
-        using var guard = this.lifecycle.EnterScope();
-        var admission = Volatile.Read(ref this.admission);
         if (!enabled)
         {
-            if (admission is FrameTimingSession active)
+            if (Volatile.Read(ref this.admission) is FrameTimingSession active)
             {
                 var openThroughTick = Stopwatch.GetTimestamp();
                 beforeStopCommit?.Invoke(this);
+                // Only detach the session observed by this stop request.
                 if (Interlocked.CompareExchange(ref this.admission, null, active) == active)
                     active.Close(openThroughTick);
             }
@@ -49,6 +52,8 @@ internal sealed class FrameTimingRecorder(int capacity = 32 * 1024, Action<Frame
             return true;
         }
 
+        using var guard = this.lifecycle.EnterScope();
+        var admission = Volatile.Read(ref this.admission);
         if (admission == ShutDown)
             return false;
 
@@ -142,22 +147,29 @@ internal sealed class FrameTimingRecorder(int capacity = 32 * 1024, Action<Frame
     /// <remarks>Call outside rendering guards.</remarks>
     /// <param name="sessionId">The requested session ID, or <c>null</c> for the latest session.</param>
     /// <param name="beforeCutoffSampled">An optional callback after pinning the session and before sampling the read cutoff.</param>
+    /// <param name="previousSummary">A prior summary of this session whose immutable history may be reused.</param>
     /// <returns>An immutable summary, or <c>null</c> if the requested session is unavailable.</returns>
-    internal FrameTimingSummary? ReadSummary(long? sessionId = null, Action? beforeCutoffSampled = null)
+    internal FrameTimingSummary? ReadSummary(
+        long? sessionId = null, Action? beforeCutoffSampled = null, FrameTimingSummary? previousSummary = null)
     {
         FrameTimingSession? session;
+        bool isFinal;
         using (this.lifecycle.EnterScope())
         {
             session = sessionId is null ? this.latest : Array.Find(this.sessions, candidate => candidate?.Id == sessionId);
             if (session is null)
                 return null;
 
+            // Check for a settled session before retaining a reader, which makes the buffer ineligible for reuse.
+            isFinal = session.CanReuseBuffer && session.CloseBounds.ClosedByTick != 0;
             session.RetainReader();
         }
 
         try
         {
-            return session.Buffer.Read(session.Id, session.StartedTick, ReadAdmission, beforeCutoffSampled: beforeCutoffSampled);
+            var summary = session.Buffer.Read(
+                session.Id, session.StartedTick, ReadAdmission, beforeCutoffSampled: beforeCutoffSampled, previousSummary: previousSummary);
+            return isFinal ? summary with { IsFinal = true } : summary;
         }
         finally
         {

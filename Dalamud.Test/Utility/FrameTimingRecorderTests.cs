@@ -431,18 +431,72 @@ public class FrameTimingRecorderTests
         var buffer = new FrameTimingBuffer(capacity: 1);
         var tick = buffer.BeginCadenceWrite();
         buffer.WriteCadence(Entry(1, tick));
+        var initial = buffer.Read(1, tick, closedTick: 0);
         buffer.BeginCadenceWrite();
 
-        var pending = buffer.Read(1, tick, closedTick: 0);
+        var pending = buffer.Read(1, tick, static () => (true, 0, 0), previousSummary: initial);
         Assert.False(pending.CoverageComplete);
-        Assert.Single(pending.Records);
+        Assert.Same(initial.Records, pending.Records);
 
         buffer.CancelCadenceWrite();
-        var settled = buffer.Read(1, tick, closedTick: 0);
+        var settled = buffer.Read(1, tick, static () => (true, 0, 0), previousSummary: pending);
         Assert.True(settled.CoverageComplete);
+        Assert.Same(pending.Records, settled.Records);
         Assert.Equal(0, settled.DroppedRecords);
         Assert.Equal(0, settled.EvictedRecords);
         Assert.Equal(tick, Assert.Single(settled.Records).StartTick);
+    }
+
+    [Fact]
+    public void StationaryRefreshSharesHistoryAndAdvancesTrailingGap()
+    {
+        var started = Stopwatch.GetTimestamp() - Stopwatch.Frequency;
+        var spacing = Stopwatch.Frequency / 10;
+        var buffer = new FrameTimingBuffer(capacity: 3);
+        for (var i = 0; i < 3; i++)
+        {
+            buffer.BeginWrite(out var sequence);
+            buffer.Write(sequence, Entry(sequence, started + (i * spacing)));
+        }
+
+        var first = buffer.Read(1, started, closedTick: 0);
+        var second = buffer.Read(1, started, static () => (true, 0, 0), previousSummary: first);
+        Assert.Same(first.Records, second.Records);
+        Assert.True(first.Cadence == second.Cadence);
+        Assert.True(second.CutoffTick > first.CutoffTick);
+
+        var firstRange = FrameTimingRange.CreateRecent(first, 10, 60);
+        var secondRange = FrameTimingRange.CreateRecent(second, 10, 60);
+        var firstCadence = firstRange.Cadence.Single(series => series.Source == FrameTimingSource.FrameworkUpdate);
+        var secondCadence = secondRange.Cadence.Single(series => series.Source == FrameTimingSource.FrameworkUpdate);
+        Assert.Equal(firstCadence.Samples.Statistics, secondCadence.Samples.Statistics);
+        Assert.True(secondCadence.TrailingGapMilliseconds > firstCadence.TrailingGapMilliseconds);
+        Assert.True(secondCadence.TrailingGapIsLowerBound);
+    }
+
+    [Fact]
+    public void RollingRefreshSharesRetainedBlocksAndPreservesPriorHistory()
+    {
+        var started = Stopwatch.GetTimestamp() - Stopwatch.Frequency;
+        var spacing = Stopwatch.Frequency / 10;
+        var buffer = new FrameTimingBuffer(capacity: 3);
+        for (var i = 0; i < 3; i++)
+        {
+            buffer.BeginWrite(out var sequence);
+            buffer.Write(sequence, Entry(sequence, started + (i * spacing)));
+        }
+
+        var before = buffer.Read(1, started, closedTick: 0);
+        buffer.BeginWrite(out var next);
+        buffer.Write(next, Entry(next, started + (3 * spacing)));
+        var after = buffer.Read(1, started, static () => (true, 0, 0), previousSummary: before);
+
+        Assert.NotSame(before.Records, after.Records);
+        Assert.True(before.Records.Blocks[1] == after.Records.Blocks[0]);
+        Assert.True(before.Records.Blocks[2] == after.Records.Blocks[1]);
+        Assert.Equal(new long[] { 1, 2, 3 }, before.Records.Select(record => record.OperationId));
+        Assert.Equal(new long[] { 2, 3, 4 }, after.Records.Select(record => record.OperationId));
+        Assert.Equal(1, after.EvictedRecords);
     }
 
     [Fact]
@@ -648,6 +702,7 @@ public class FrameTimingRecorderTests
         Assert.Equal(0, summary.DroppedRecords);
         Assert.Equal(0, summary.EvictedRecords);
         Assert.False(summary.CoverageComplete);
+        Assert.False(FrameTimingRange.Create(summary, 40, 70, targetRate: 60).CoverageComplete);
         Assert.False(cadence.CoverageComplete);
         Assert.Equal<FrameTimingInterval>([new(40, 50), new(50, 60)], cadence.Intervals);
         Assert.Equal(31, summary.RetainedFromTick);
@@ -809,6 +864,7 @@ public class FrameTimingRecorderTests
         Assert.True(cadence.CoverageComplete);
         Assert.Equal(new long[] { 10, 20 }, cadence.Entries.Select(record => record.StartTick));
         Assert.Equal(new FrameTimingInterval(10, 20), Assert.Single(cadence.Intervals));
+        Assert.True(FrameTimingRange.Create(summary, 10, 30, targetRate: 60).CoverageComplete);
 
         var later = buffer.Read(1, startedTick: 1, closedTick: 31);
         var laterCadence = later.Cadence.Single(series => series.Source == FrameTimingSource.FrameworkUpdate);
@@ -831,6 +887,7 @@ public class FrameTimingRecorderTests
         Assert.Equal(2, summary.DroppedRecords);
         Assert.False(cadence.CoverageComplete);
         Assert.Equal<FrameTimingInterval>([new(30, 40), new(40, 50)], cadence.Intervals);
+        Assert.True(FrameTimingRange.Create(summary, 21, 55, targetRate: 60).CoverageComplete);
     }
 
     [Fact]
@@ -872,6 +929,42 @@ public class FrameTimingRecorderTests
         Assert.Equal(0, reused.EvictedRecords);
         Assert.True(reused.CoverageComplete);
         Assert.All(reused.Cadence, series => Assert.True(series.CoverageComplete));
+    }
+
+    [Fact]
+    public void NonCadenceDropOverflowUsesConservativeBoundsAndResetsOnReuse()
+    {
+        var elapsed = new FrameTimingRecord(0, 10, 12, 1, FrameTimingSource.KernelPresent,
+            FrameTimingSpan.KernelPresent, FrameTimingRecordKind.Elapsed);
+        // With room for two exact loss records, the last two drops use shared bounds.
+        var buffer = WriteWithDelayedDrops(
+            2,
+            [Entry(0, 20), Entry(0, 80)],
+            elapsed,
+            elapsed with { StartTick = 20, EndTick = 22 },
+            elapsed with { StartTick = 35, EndTick = 40 },
+            elapsed with { StartTick = 65, EndTick = 70 });
+
+        var summary = buffer.Read(1, startedTick: 1, closedTick: 100);
+        Assert.Equal(4, summary.DroppedRecords);
+        Assert.Equal(0, summary.UnreadRecords);
+        Assert.True(FrameTimingRange.Create(summary, 23, 40, targetRate: 60).CoverageComplete);
+        Assert.False(FrameTimingRange.Create(summary, 45, 60, targetRate: 60).CoverageComplete);
+        Assert.True(FrameTimingRange.Create(summary, 66, 100, targetRate: 60).CoverageComplete);
+
+        var successor = buffer.CreateSuccessor();
+        successor.BeginWrite(out var delayed);
+        foreach (var tick in new long[] { 45, 50 })
+        {
+            successor.BeginWrite(out var sequence);
+            successor.Write(sequence, Entry(sequence, tick));
+        }
+
+        successor.Write(delayed, elapsed);
+        var reused = successor.Read(2, startedTick: 1, closedTick: 100);
+        Assert.Equal(1, reused.DroppedRecords);
+        Assert.True(FrameTimingRange.Create(reused, 45, 60, targetRate: 60).CoverageComplete);
+        Assert.False(FrameTimingRange.Create(summary, 45, 60, targetRate: 60).CoverageComplete);
     }
 
     [Fact]

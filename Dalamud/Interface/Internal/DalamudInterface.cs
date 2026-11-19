@@ -44,6 +44,7 @@ using Dalamud.Plugin.Internal;
 using Dalamud.Plugin.SelfTest.Internal;
 using Dalamud.Storage.Assets;
 using Dalamud.Utility;
+using Dalamud.Utility.Timing;
 
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Component.GUI;
@@ -75,6 +76,7 @@ internal class DalamudInterface : IInternalDisposableService
     private readonly GamepadModeNotifier gamepadModeNotifier;
     private readonly ConsoleWindow consoleWindow;
     private readonly PluginStatWindow pluginStatWindow;
+    private readonly FrameTimingMonitorWindow frameTimingMonitorWindow;
     private readonly PluginInstallerWindow pluginWindow;
     private readonly SettingsWindow settingsWindow;
     private readonly SelfTestWindow selfTestWindow;
@@ -134,6 +136,9 @@ internal class DalamudInterface : IInternalDisposableService
         this.gamepadModeNotifier = new GamepadModeNotifier(fontAtlasFactory);
         this.consoleWindow = new ConsoleWindow(configuration) { IsOpen = configuration.LogOpenAtStartup };
         this.pluginStatWindow = new PluginStatWindow { IsOpen = false };
+        var frameTimingMonitor = new FrameTimingMonitorController(
+            configuration, FrameTimingRecorder.Instance, () => interfaceManager.FrameTimingOverlaySource);
+        this.frameTimingMonitorWindow = new FrameTimingMonitorWindow(frameTimingMonitor);
         this.pluginWindow = new PluginInstallerWindow(pluginImageCache, configuration) { IsOpen = false };
         this.settingsWindow = new SettingsWindow { IsOpen = false };
         this.selfTestWindow = new SelfTestWindow(selfTestRegistry) { IsOpen = false };
@@ -170,6 +175,7 @@ internal class DalamudInterface : IInternalDisposableService
         this.WindowSystem.AddWindow(this.dataWindow);
         this.WindowSystem.AddWindow(this.consoleWindow);
         this.WindowSystem.AddWindow(this.pluginStatWindow);
+        this.WindowSystem.AddWindow(this.frameTimingMonitorWindow);
         this.WindowSystem.AddWindow(this.pluginWindow);
         this.WindowSystem.AddWindow(this.settingsWindow);
         this.WindowSystem.AddWindow(this.selfTestWindow);
@@ -185,6 +191,8 @@ internal class DalamudInterface : IInternalDisposableService
         this.isImGuiDrawDevMenu = this.isImGuiDrawDevMenu || configuration.DevBarOpenAtStartup;
 
         this.interfaceManager.Draw += this.OnDraw;
+        // Skipped draw dispatch bypasses window callbacks that would release the readout.
+        this.interfaceManager.DrawSuppressed += this.frameTimingMonitorWindow.StopReadout;
 
         Service<InterfaceManager.InterfaceManagerWithScene>.GetAsync().ContinueWith(
             _ =>
@@ -274,6 +282,8 @@ internal class DalamudInterface : IInternalDisposableService
     void IInternalDisposableService.DisposeService()
     {
         this.interfaceManager.Draw -= this.OnDraw;
+        this.interfaceManager.DrawSuppressed -= this.frameTimingMonitorWindow.StopReadout;
+        this.frameTimingMonitorWindow.Shutdown();
 
         this.WindowSystem.Windows.OfType<IDisposable>().AggregateToDisposable().Dispose();
         this.WindowSystem.RemoveAllWindows();
@@ -342,6 +352,13 @@ internal class DalamudInterface : IInternalDisposableService
     {
         this.pluginStatWindow.IsOpen = true;
         this.pluginStatWindow.BringToFront();
+    }
+
+    /// <summary>Opens and focuses the Frame Timing Monitor.</summary>
+    public void OpenFrameTimingMonitor()
+    {
+        this.frameTimingMonitorWindow.IsOpen = true;
+        this.frameTimingMonitorWindow.BringToFront();
     }
 
     /// <summary>
@@ -591,7 +608,10 @@ internal class DalamudInterface : IInternalDisposableService
                 this.DrawTitleScreenBadges();
 
                 if (Service<GameGui>.Get().GameUiHidden)
+                {
+                    this.frameTimingMonitorWindow.StopReadout();
                     return;
+                }
 
                 this.WindowSystem.Draw();
 
@@ -615,10 +635,15 @@ internal class DalamudInterface : IInternalDisposableService
             }
             catch (Exception ex)
             {
+                this.frameTimingMonitorWindow.StopReadout();
                 Log.Error(ex, "Error during OnDraw");
                 this.hasDrawError = true;
                 this.lastDrawError = ex;
             }
+        }
+        else
+        {
+            this.frameTimingMonitorWindow.StopReadout();
         }
 
         if (this.hasDrawError)
@@ -921,6 +946,11 @@ internal class DalamudInterface : IInternalDisposableService
                     if (ImGui.MenuItem("Open Hitch Settings"u8))
                     {
                         this.OpenHitchSettings();
+                    }
+
+                    if (ImGui.MenuItem("Frame Timing Monitor"u8))
+                    {
+                        this.OpenFrameTimingMonitor();
                     }
 
                     ImGui.Separator();

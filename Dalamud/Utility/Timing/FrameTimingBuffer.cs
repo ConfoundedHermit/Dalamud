@@ -1,7 +1,7 @@
 using System;
+using System.Buffers;
 using System.Collections.Immutable;
 using System.Diagnostics;
-using System.Linq;
 using System.Threading;
 
 namespace Dalamud.Utility.Timing;
@@ -9,15 +9,17 @@ namespace Dalamud.Utility.Timing;
 /// <summary>A fixed-size history ring with nonblocking publication and validated reads.</summary>
 internal sealed class FrameTimingBuffer
 {
-    private const int MaxTrackedCadenceDrops = 256;
+    private const int MaxTrackedDrops = 256;
     private static readonly FrameTimingSource[] Sources = Enum.GetValues<FrameTimingSource>();
 
     private readonly Slot[] slots;
-    // Keep the latest failed sequence per slot so a reader can recover the previous record after a drop.
+    // A failed reservation leaves the previous record in its slot. Track the latest failure so readers can recover it.
     private readonly long[] droppedSequences;
     // Retain individual cadence loss ticks up to the limit, then widen the affected source's loss range.
     private readonly CadenceDrop[] cadenceDrops;
     private readonly DropRange[] cadenceDropOverflow = CreateDropRanges();
+    // Span and event losses have their own tracking limit, preserving cadence loss detail.
+    private readonly FrameTimingRecordLoss[] nonCadenceDrops;
     // Ignore sequence stamps at or below this boundary when reading reused storage.
     private readonly long sequenceBase;
     private long nextSequence;
@@ -25,6 +27,9 @@ internal sealed class FrameTimingBuffer
     private long droppedRecords;
     private long latestDroppedStartTick;
     private long cadenceDropCount;
+    private long nonCadenceDropCount;
+    private long latestNonCadenceOverflowStart;
+    private long earliestNonCadenceOverflowEnd = long.MaxValue;
     private long evictedRecords;
     private long latestEvictedStartTick;
 
@@ -35,7 +40,9 @@ internal sealed class FrameTimingBuffer
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(capacity);
         this.slots = new Slot[capacity];
         this.droppedSequences = new long[capacity];
-        this.cadenceDrops = new CadenceDrop[Math.Min(capacity, MaxTrackedCadenceDrops)];
+        var trackedDropCapacity = Math.Min(capacity, MaxTrackedDrops);
+        this.cadenceDrops = new CadenceDrop[trackedDropCapacity];
+        this.nonCadenceDrops = new FrameTimingRecordLoss[trackedDropCapacity];
     }
 
     private FrameTimingBuffer(FrameTimingBuffer previous)
@@ -43,6 +50,7 @@ internal sealed class FrameTimingBuffer
         this.slots = previous.slots;
         this.droppedSequences = previous.droppedSequences;
         this.cadenceDrops = previous.cadenceDrops;
+        this.nonCadenceDrops = previous.nonCadenceDrops;
         this.sequenceBase = previous.nextSequence;
         this.nextSequence = this.sequenceBase;
     }
@@ -105,6 +113,19 @@ internal sealed class FrameTimingBuffer
                     MaintainMaximum(ref overflow.LastTick, record.StartTick);
                 }
             }
+            else
+            {
+                var dropIndex = Interlocked.Increment(ref this.nonCadenceDropCount) - 1;
+                if (dropIndex < this.nonCadenceDrops.Length)
+                {
+                    this.nonCadenceDrops[dropIndex] = new(record.StartTick, record.EndTick);
+                }
+                else
+                {
+                    MaintainMaximum(ref this.latestNonCadenceOverflowStart, record.StartTick);
+                    MaintainMinimum(ref this.earliestNonCadenceOverflowEnd, record.EndTick);
+                }
+            }
         }
         else
         {
@@ -136,18 +157,18 @@ internal sealed class FrameTimingBuffer
     /// <param name="readAdmission">Reads admission and its closure bounds after the cutoff is sampled.</param>
     /// <param name="beforeCutoffSampled">An optional callback before sampling the cutoff and write counters.</param>
     /// <param name="afterCutoffSampled">An optional callback that receives the sampled read cutoff before copying begins.</param>
+    /// <param name="previousSummary">A prior summary of this session whose immutable history may be reused.</param>
     /// <returns>The immutable summary and its coverage bounds.</returns>
     internal FrameTimingSummary Read(
         long sessionId,
         long startedTick,
         Func<(bool AdmitsProbes, long OpenThroughTick, long ClosedByTick)> readAdmission,
         Action? beforeCutoffSampled = null,
-        Action<long>? afterCutoffSampled = null)
+        Action<long>? afterCutoffSampled = null,
+        FrameTimingSummary? previousSummary = null)
     {
-        var estimatedCount = (int)Math.Min(Volatile.Read(ref this.nextSequence) - this.sequenceBase, this.slots.Length);
-        var records = ImmutableArray.CreateBuilder<FrameTimingRecord>(estimatedCount);
         beforeCutoffSampled?.Invoke();
-        // Bracket the cutoff and loss counters to detect writes that could obscure cadence adjacency.
+        // Bracket the cutoff and loss counters to detect reservations or pending writes that can obscure coverage.
         var before = Volatile.Read(ref this.nextSequence);
         var pendingBefore = Volatile.Read(ref this.activeWrites);
         var dropCount = Volatile.Read(ref this.droppedRecords);
@@ -166,6 +187,13 @@ internal sealed class FrameTimingBuffer
             };
         }
 
+        var nonCadenceDropCount = Volatile.Read(ref this.nonCadenceDropCount);
+        var hasNonCadenceOverflow = nonCadenceDropCount > this.nonCadenceDrops.Length;
+        var nonCadenceOverflow = hasNonCadenceOverflow
+                                     ? new FrameTimingRecordLoss(
+                                         Volatile.Read(ref this.latestNonCadenceOverflowStart),
+                                         Volatile.Read(ref this.earliestNonCadenceOverflowEnd))
+                                     : default;
         var evicted = Volatile.Read(ref this.evictedRecords);
         var evictedStartTick = Volatile.Read(ref this.latestEvictedStartTick);
         var readCutoff = Stopwatch.GetTimestamp();
@@ -183,6 +211,9 @@ internal sealed class FrameTimingBuffer
         // Start after the latest evicted start tick to exclude cadence entries that share that tick.
         var retainedFrom = Math.Max(startedTick, evictedStartTick + 1);
         var missing = 0;
+        using var scratch = MemoryPool<FrameTimingRecord>.Shared.Rent((int)(last - first + 1));
+        var records = scratch.Memory.Span;
+        var recordCount = 0;
 
         for (var sequence = first; sequence <= last; sequence++)
         {
@@ -202,7 +233,7 @@ internal sealed class FrameTimingBuffer
                     {
                         // A writer outside the sampled sequence range can share the cutoff tick.
                         if (record.EndTick < readCutoff)
-                            records.Add(record);
+                            records[recordCount++] = record;
 
                         // An admitted entry at the exclusive boundary still confirms admission up to it.
                         if (record.Kind == FrameTimingRecordKind.Cadence && record.StartTick <= cadenceCutoff)
@@ -225,21 +256,108 @@ internal sealed class FrameTimingBuffer
         {
             // Delayed writes can reorder records by tick, so trim every record before the new start.
             retainedFrom = Math.Max(retainedFrom, Volatile.Read(ref this.latestEvictedStartTick) + 1);
-            records.RemoveAll(record => record.StartTick < retainedFrom);
+            var retainedCount = 0;
+            foreach (ref readonly var record in records[..recordCount])
+            {
+                if (record.StartTick >= retainedFrom)
+                    records[retainedCount++] = record;
+            }
+
+            recordCount = retainedCount;
         }
 
         var hasCadenceWindow = retainedFrom < cadenceCutoff;
-        var readComplete = canEstablishAdjacency && missing == 0 &&
-                           confirmedThrough == cadenceCutoff && hasCadenceWindow;
+        var readValidated = canEstablishAdjacency && missing == 0;
+        var readComplete = readValidated && confirmedThrough == cadenceCutoff && hasCadenceWindow;
         var recordCoverageComplete = readComplete && (dropCount == 0 || droppedStartTick < retainedFrom);
-        // Individual drop ticks are safe to read once all writes in the sampled range have resolved.
+        // Range coverage requires a validated set of sampled slots and loss endpoints.
+        var nonCadenceLosses = ImmutableArray<FrameTimingRecordLoss>.Empty;
+        if (readValidated && nonCadenceDropCount > 0)
+        {
+            var trackedCount = (int)Math.Min(nonCadenceDropCount, this.nonCadenceDrops.Length);
+            var losses = ImmutableArray.CreateBuilder<FrameTimingRecordLoss>(trackedCount + (hasNonCadenceOverflow ? 1 : 0));
+            losses.AddRange(this.nonCadenceDrops.AsSpan(0, trackedCount));
+            if (hasNonCadenceOverflow)
+                losses.Add(nonCadenceOverflow);
+
+            nonCadenceLosses = losses.MoveToImmutable();
+        }
+
+        // With no pending writes at the cutoff, recorded drop ticks can rule out individual intervals.
         var trackedDrops = canEstablishAdjacency
                                ? this.cadenceDrops.AsSpan(0, (int)Math.Min(cadenceDropCount, this.cadenceDrops.Length))
                                : Span<CadenceDrop>.Empty;
-        records.Sort(static (left, right) => left.StartTick.CompareTo(right.StartTick));
-        var immutableRecords = records.DrainToImmutable();
-        var cadence = ImmutableArray.CreateBuilder<FrameTimingCadence>();
+        records = records[..recordCount];
+        records.Sort(CompareRecordTime);
+        var previous = previousSummary?.SessionId == sessionId ? previousSummary : null;
+        var history = FrameTimingHistory.Create(records, previous?.Records);
+        // Reuse intervals when both reads validate the same history without drops or a change in included entries.
+        var cadence = previous is { ReadValidated: true, DroppedRecords: 0 } && readValidated && dropCount == 0 &&
+                      ReferenceEquals(history, previous.Records) &&
+                      (cadenceCutoff == previous.CutoffTick || records.IsEmpty ||
+                       records[^1].StartTick < Math.Min(cadenceCutoff, previous.CutoffTick))
+                          ? RefreshCadenceCoverage(previous.Cadence, readComplete)
+                          : BuildCadence(records, cadenceCutoff, retainedFrom, canEstablishAdjacency,
+                                         readValidated, readComplete, trackedDrops, overflow);
+
+        return new(
+            sessionId, startedTick, Math.Min(retainedFrom, cadenceCutoff), cadenceCutoff, confirmedThrough,
+            collecting, this.slots.Length, dropCount, evicted, missing, recordCoverageComplete, history, cadence)
+        {
+            ReadValidated = readValidated,
+            NonCadenceLosses = nonCadenceLosses,
+        };
+    }
+
+    private static int CompareRecordTime(FrameTimingRecord left, FrameTimingRecord right)
+    {
+        var byStart = left.StartTick.CompareTo(right.StartTick);
+        if (byStart != 0)
+            return byStart;
+
+        // Break timestamp ties consistently so otherwise unchanged history blocks can be shared.
+        return (left.OperationId, left.EndTick, (byte)left.Kind, (byte)left.Source, (byte)left.Span, left.ThreadId,
+                (byte)left.Outcome, (byte)left.Target, left.NativeStatus, left.SnapshotId, left.SnapshotAgeTicks)
+            .CompareTo((right.OperationId, right.EndTick, (byte)right.Kind, (byte)right.Source, (byte)right.Span, right.ThreadId,
+                        (byte)right.Outcome, (byte)right.Target, right.NativeStatus, right.SnapshotId, right.SnapshotAgeTicks));
+    }
+
+    private static ImmutableArray<FrameTimingCadence> RefreshCadenceCoverage(
+        ImmutableArray<FrameTimingCadence> cadence, bool readComplete)
+    {
+        if (cadence[0].CoverageComplete == readComplete)
+            return cadence;
+
+        var updated = ImmutableArray.CreateBuilder<FrameTimingCadence>(cadence.Length);
+        foreach (var series in cadence)
+            updated.Add(series with { CoverageComplete = readComplete });
+
+        return updated.MoveToImmutable();
+    }
+
+    private static ImmutableArray<FrameTimingCadence> BuildCadence(
+        ReadOnlySpan<FrameTimingRecord> records,
+        long cadenceCutoff,
+        long retainedFrom,
+        bool canEstablishAdjacency,
+        bool readValidated,
+        bool readComplete,
+        ReadOnlySpan<CadenceDrop> trackedDrops,
+        ReadOnlySpan<DropRange> overflow)
+    {
+        var cadence = ImmutableArray.CreateBuilder<FrameTimingCadence>(Sources.Length - 1);
+        var hasCadenceWindow = retainedFrom < cadenceCutoff;
         Span<long> dropTickWorkspace = stackalloc long[trackedDrops.Length];
+        Span<int> entryCounts = stackalloc int[(int)Sources[^1] + 1];
+        entryCounts.Clear();
+        foreach (ref readonly var record in records)
+        {
+            if (record.StartTick >= cadenceCutoff)
+                break;
+
+            if (record.Kind == FrameTimingRecordKind.Cadence && (int)record.Source < entryCounts.Length)
+                entryCounts[(int)record.Source]++;
+        }
 
         foreach (var source in Sources)
         {
@@ -256,15 +374,23 @@ internal sealed class FrameTimingBuffer
             }
 
             var droppedTicks = dropTickWorkspace[..dropTickCount];
-            var entries = immutableRecords.Where(record => record.Kind == FrameTimingRecordKind.Cadence &&
-                                                           record.Source == source && record.StartTick < cadenceCutoff)
-                                          .ToImmutableArray();
-            var intervals = ImmutableArray.CreateBuilder<FrameTimingInterval>();
+            var entryCount = entryCounts[(int)source];
+            var entries = ImmutableArray.CreateBuilder<FrameTimingRecord>(entryCount);
+            if (entryCount > 0)
+            {
+                foreach (ref readonly var record in records)
+                {
+                    if (record.Kind == FrameTimingRecordKind.Cadence && record.Source == source && record.StartTick < cadenceCutoff)
+                        entries.Add(record);
+                }
+            }
+
+            var intervals = ImmutableArray.CreateBuilder<FrameTimingInterval>(canEstablishAdjacency ? Math.Max(0, entryCount - 1) : 0);
             if (canEstablishAdjacency)
             {
                 droppedTicks.Sort();
                 var nextDrop = 0;
-                for (var i = 1; i < entries.Length; i++)
+                for (var i = 1; i < entries.Count; i++)
                 {
                     var previousTick = entries[i - 1].StartTick;
                     var currentTick = entries[i].StartTick;
@@ -279,12 +405,21 @@ internal sealed class FrameTimingBuffer
             }
 
             var cadenceComplete = readComplete && droppedTicks.IsEmpty && !overflowInWindow;
-            cadence.Add(new(source, cadenceComplete, entries, intervals.ToImmutable()));
+            var lossRanges = ImmutableArray.CreateBuilder<FrameTimingInterval>(dropTickCount + (overflowInWindow ? 1 : 0));
+            foreach (var tick in droppedTicks)
+                lossRanges.Add(new(tick, tick));
+
+            if (overflowInWindow)
+                lossRanges.Add(new(overflowRange.FirstTick, overflowRange.LastTick));
+
+            cadence.Add(new(source, cadenceComplete, entries.MoveToImmutable(), intervals.DrainToImmutable())
+            {
+                ReadValidated = readValidated,
+                LossRanges = lossRanges.MoveToImmutable(),
+            });
         }
 
-        return new(
-            sessionId, startedTick, Math.Min(retainedFrom, cadenceCutoff), cadenceCutoff, confirmedThrough,
-            collecting, this.slots.Length, dropCount, evicted, missing, recordCoverageComplete, immutableRecords, cadence.ToImmutable());
+        return cadence.MoveToImmutable();
     }
 
     private static DropRange[] CreateDropRanges()
